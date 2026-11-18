@@ -1,0 +1,212 @@
+/* Copyright 2026 Marimo. All rights reserved. */
+import { describe, expect, it, vi } from "vitest";
+import {
+  countFractionDigits,
+  fractionDigitsForSlider,
+  maxFractionDigitsForSteps,
+  prettyEngineeringNumber,
+  prettyNumber,
+  prettyScientificNumber,
+} from "../numbers";
+
+const locale = "en-US";
+
+describe("prettyNumber", () => {
+  it("should format numbers", () => {
+    expect(prettyNumber(123_456_789, locale)).toBe("123,456,789");
+    expect(prettyNumber(1234.567_89, locale)).toBe("1,234.57");
+    expect(prettyNumber(0, locale)).toBe("0");
+  });
+});
+
+const options = { locale };
+
+describe("formatter reuse", () => {
+  it.each([
+    {
+      name: "scientific",
+      value: 0.000_123_4,
+      format: (value: number, locale: string) =>
+        prettyScientificNumber(value, { locale }),
+    },
+    {
+      name: "rounded",
+      value: 1234.567,
+      format: (value: number, locale: string) =>
+        prettyScientificNumber(value, { locale, shouldRound: true }),
+    },
+    {
+      name: "engineering",
+      value: 12_345,
+      format: prettyEngineeringNumber,
+    },
+  ])(
+    "reuses the $name formatter until the locale changes",
+    ({ format, value }) => {
+      const NumberFormat = Intl.NumberFormat;
+      const constructor = vi
+        .spyOn(Intl, "NumberFormat")
+        .mockImplementation(function (locales, options) {
+          return new NumberFormat(locales, options);
+        });
+      try {
+        const first = format(value, "fr-FR");
+        expect(format(value, "fr-FR")).toBe(first);
+        format(value * 2, "fr-FR");
+        expect(constructor).toHaveBeenCalledTimes(1);
+
+        format(value, "de-DE");
+        expect(constructor).toHaveBeenCalledTimes(2);
+        expect(constructor).toHaveBeenLastCalledWith(
+          "de-DE",
+          expect.any(Object),
+        );
+      } finally {
+        constructor.mockRestore();
+      }
+    },
+  );
+});
+
+describe("prettyScientificNumber", () => {
+  it("should handle special cases", () => {
+    expect(prettyScientificNumber(0, options)).toBe("0");
+    expect(prettyScientificNumber(Number.NaN, options)).toBe("NaN");
+    expect(prettyScientificNumber(Number.POSITIVE_INFINITY, options)).toBe(
+      "Infinity",
+    );
+    expect(prettyScientificNumber(Number.NEGATIVE_INFINITY, options)).toBe(
+      "-Infinity",
+    );
+  });
+
+  it("should format decimals with scientific notation, ignoring integer part rounding", () => {
+    const opts = { shouldRound: true, locale };
+    expect(prettyScientificNumber(123_456, opts)).toBe("123,456");
+    expect(prettyScientificNumber(123_456.7, opts)).toBe("123,456.7");
+    expect(prettyScientificNumber(12_345.6789, opts)).toBe("12,345.68");
+    expect(prettyScientificNumber(1.2345, opts)).toBe("1.23");
+    expect(prettyScientificNumber(1.000_001_234, opts)).toBe("1");
+    expect(prettyScientificNumber(0.12, opts)).toBe("0.12");
+    expect(prettyScientificNumber(0.1234, opts)).toBe("0.12");
+    expect(prettyScientificNumber(0.000_123_4, opts)).toBe("1.2e-4");
+    expect(prettyScientificNumber(-1.2345, opts)).toBe("-1.23"); // Test with negative numbers
+    expect(prettyScientificNumber(-1.000_001_234, opts)).toBe("-1");
+    expect(prettyScientificNumber(-0.12, opts)).toBe("-0.12");
+    expect(prettyScientificNumber(-0.1234, opts)).toBe("-0.12");
+    expect(prettyScientificNumber(-0.000_123_4, opts)).toBe("-1.2e-4");
+  });
+
+  it("should not round numbers when shouldRound is false", () => {
+    expect(prettyScientificNumber(123_456, options)).toBe("123,456");
+    expect(prettyScientificNumber(123_456.7, options)).toBe("123,456.7");
+    expect(prettyScientificNumber(12_345.6789, options)).toBe("12,345.6789");
+    expect(prettyScientificNumber(1.234_567_891_011_12, options)).toBe(
+      "1.23456789101112",
+    );
+  });
+
+  it("supports caller-provided display precision", () => {
+    expect(
+      prettyScientificNumber(1.2340000000000002, {
+        maximumFractionDigits: 2,
+        locale,
+      }),
+    ).toBe("1.23");
+    expect(
+      prettyScientificNumber(1.2340000000000002, {
+        maximumFractionDigits: 3,
+        locale,
+      }),
+    ).toBe("1.234");
+    expect(
+      prettyScientificNumber(1.234, {
+        maximumFractionDigits: 3,
+        locale,
+      }),
+    ).toBe("1.234");
+  });
+
+  it("preserves caller-provided precision in scientific notation", () => {
+    expect(
+      prettyScientificNumber(0.0012300000000000002, {
+        maximumFractionDigits: 5,
+        locale,
+      }),
+    ).toBe("1.23e-3");
+    expect(
+      prettyScientificNumber(1_000_001.2300000001, {
+        maximumFractionDigits: 2,
+        locale,
+      }),
+    ).toBe("1.00000123e6");
+  });
+});
+
+describe("prettyEngineeringNumber", () => {
+  it("should handle special cases", () => {
+    expect(prettyEngineeringNumber(0, locale)).toBe("0");
+    expect(prettyEngineeringNumber(-0, locale)).toBe("0"); // Test with negative zero
+    expect(prettyEngineeringNumber(Number.NaN, locale)).toBe("NaN");
+    expect(prettyEngineeringNumber(Number.POSITIVE_INFINITY, locale)).toBe(
+      "Infinity",
+    );
+    expect(prettyEngineeringNumber(Number.NEGATIVE_INFINITY, locale)).toBe(
+      "-Infinity",
+    );
+  });
+
+  it("should format decimals with engineering notation, ignoring integer part", () => {
+    expect(prettyEngineeringNumber(123_456, locale)).toBe("123k");
+    expect(prettyEngineeringNumber(123_456.7, locale)).toBe("123k");
+    expect(prettyEngineeringNumber(12_345.6789, locale)).toBe("12.3k");
+    expect(prettyEngineeringNumber(1.2345, locale)).toBe("1.23");
+    expect(prettyEngineeringNumber(1.000_001_234, locale)).toBe("1");
+    expect(prettyEngineeringNumber(0.12, locale)).toBe("120m");
+    expect(prettyEngineeringNumber(0.1234, locale)).toBe("123m");
+    expect(prettyEngineeringNumber(0.000_123_4, locale)).toBe("123µ");
+    expect(prettyEngineeringNumber(-1.2345, locale)).toBe("-1.23"); // Test with negative numbers
+    expect(prettyEngineeringNumber(-1.000_001_234, locale)).toBe("-1");
+    expect(prettyEngineeringNumber(-0.12, locale)).toBe("-120m");
+    expect(prettyEngineeringNumber(-0.1234, locale)).toBe("-123m");
+    expect(prettyEngineeringNumber(-0.000_123_4, locale)).toBe("-123µ");
+  });
+});
+
+describe("countFractionDigits", () => {
+  it("counts decimal places without float noise", () => {
+    expect(countFractionDigits(1)).toBe(0);
+    expect(countFractionDigits(0.1)).toBe(1);
+    expect(countFractionDigits(0.3)).toBe(1);
+    expect(countFractionDigits(0.000025)).toBe(6);
+    expect(countFractionDigits(3.5)).toBe(1);
+  });
+});
+
+describe("maxFractionDigitsForSteps", () => {
+  it("infers precision from steps and gaps", () => {
+    expect(maxFractionDigitsForSteps([0.1, 0.2, 0.3, 0.4], 0.1)).toBe(1);
+    expect(maxFractionDigitsForSteps([1, 2, 3.5, 4], 0.5)).toBe(1);
+    expect(maxFractionDigitsForSteps([1, 2, 3, 4], 1)).toBe(0);
+  });
+});
+
+describe("fractionDigitsForSlider", () => {
+  it("preserves precision for regular slider steps", () => {
+    expect(fractionDigitsForSlider(0.001)).toBe(3);
+    expect(fractionDigitsForSlider(0.01)).toBe(2);
+    expect(fractionDigitsForSlider(undefined)).toBe(2);
+    expect(fractionDigitsForSlider(undefined, null, 0, [0.1234, 0.5])).toBe(4);
+  });
+
+  it("infers precision from custom step values", () => {
+    expect(fractionDigitsForSlider(undefined, [1, 1.234, 2])).toBe(3);
+    expect(
+      fractionDigitsForSlider(undefined, [0.1, 0.2, 0.30000000000000004]),
+    ).toBe(1);
+  });
+
+  it("includes the slider origin in regular step precision", () => {
+    expect(fractionDigitsForSlider(1, null, 0.5)).toBe(1);
+  });
+});

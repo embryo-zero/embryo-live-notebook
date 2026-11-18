@@ -1,0 +1,80 @@
+/* Copyright 2026 Marimo. All rights reserved. */
+
+import { type CalendarDateTime, parseDateTime } from "@internationalized/date";
+import { type JSX, useId } from "react";
+import { z } from "zod";
+import { DatePicker } from "@/components/ui/date-picker";
+import type { IPlugin, IPluginProps, Setter } from "../types";
+import { Labeled } from "./common/labeled";
+
+type T = string;
+
+interface Data {
+  label: string | null;
+  start: string;
+  stop: string;
+  step?: string;
+  precision: "hour" | "minute" | "second";
+  fullWidth: boolean;
+  disabled?: boolean;
+}
+
+export class DateTimePickerPlugin implements IPlugin<T, Data> {
+  public tagName = "marimo-datetime";
+
+  public validator = z.object({
+    initialValue: z.string(),
+    label: z.string().nullable(),
+    start: z.string(),
+    stop: z.string(),
+    step: z.string().optional(),
+    precision: z.enum(["hour", "minute", "second"]).default("minute"),
+    fullWidth: z.boolean().default(false),
+    disabled: z.boolean().optional(),
+  });
+
+  public render(props: IPluginProps<T, Data>): JSX.Element {
+    return (
+      <DateTimePickerComponent
+        {...props.data}
+        value={props.value}
+        setValue={props.setValue}
+      />
+    );
+  }
+}
+
+interface DateTimePickerProps extends Data {
+  value: T;
+  setValue: Setter<T>;
+}
+
+const DateTimePickerComponent = (props: DateTimePickerProps): JSX.Element => {
+  const labelId = useId();
+  const handleInput = (valueAsDateTime: CalendarDateTime | null) => {
+    if (!valueAsDateTime) {
+      return;
+    }
+
+    const isoStr = valueAsDateTime.toString();
+    props.setValue(isoStr);
+  };
+
+  // Add null check and default to undefined when no value is provided
+  const parsedValue = props.value ? parseDateTime(props.value) : undefined;
+
+  return (
+    <Labeled labelId={labelId} label={props.label} fullWidth={props.fullWidth}>
+      <DatePicker
+        granularity={props.precision}
+        value={parsedValue}
+        onChange={handleInput}
+        aria-labelledby={props.label ? labelId : undefined}
+        aria-label={props.label ? undefined : "date time picker"}
+        minValue={parseDateTime(props.start)}
+        maxValue={parseDateTime(props.stop)}
+        isDisabled={props.disabled}
+      />
+    </Labeled>
+  );
+};

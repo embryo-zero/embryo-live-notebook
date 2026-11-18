@@ -1,0 +1,115 @@
+/* Copyright 2026 Marimo. All rights reserved. */
+/* oxlint-disable typescript/no-explicit-any */
+
+import { toast } from "@/components/ui/use-toast";
+import { HTTPError, prettyError } from "@/utils/errors";
+import { Logger } from "@/utils/Logger";
+import type { EditRequests, RequestKey, RunRequests } from "./types";
+
+export function createErrorToastingRequests(
+  delegate: EditRequests & RunRequests,
+): EditRequests & RunRequests {
+  const MESSAGES: Record<RequestKey, string> = {
+    sendComponentValues: "Failed update value",
+    sendModelValue: "Failed to update model value",
+    sendInstantiate: "Failed to instantiate",
+    sendFunctionRequest: "Failed to send function request",
+    sendRestart: "Failed to restart",
+    sendRunScratchpad: "Failed to run scratchpad",
+    sendRename: "Failed to rename",
+    saveLayout: "", // The save reports it
+    sendCopy: "Failed to copy",
+    sendShutdown: "Failed to shutdown",
+    sendFormat: "Failed to format",
+    sendCodeCompletionRequest: "Failed to complete code",
+    saveUserConfig: "Failed to save user config",
+    saveAppConfig: "Failed to save app config",
+    readCode: "Failed to read code",
+    readSnippets: "Failed to fetch snippets",
+    previewDatasetColumn: "Failed to fetch data sources",
+    previewSQLTable: "Failed to fetch SQL table",
+    previewSQLTableList: "Failed to fetch SQL table list",
+    previewSQLSchemaList: "Failed to fetch SQL schema list",
+    previewDataSourceConnection: "Failed to preview data source connection",
+    discoverDataSources: "Failed to discover data sources",
+    validateSQL: "Failed to validate SQL",
+    openFile: "Failed to open file",
+    getUsageStats: "", // No toast
+    getEnvironmentInfo: "", // No toast
+    getFileRoots: "", // RequestingTree surfaces this error
+    sendListFiles: "Failed to list files",
+    sendSearchFiles: "", // Search callers handle errors
+    sendPdb: "Failed to start debug session",
+    sendSetBreakpoints: "", // No toast
+    sendCreateFileOrFolder: "Failed to create file or folder",
+    sendDeleteFileOrFolder: "Failed to delete file or folder",
+    sendCopyFileOrFolder: "Failed to duplicate file or folder",
+    sendRenameFileOrFolder: "Failed to rename file or folder",
+    sendUpdateFile: "Failed to update file",
+    sendFileDetails: "Failed to get file details",
+    openTutorial: "Failed to open tutorial",
+    sendInstallMissingPackages: "Failed to install missing packages",
+    getRecentFiles: "Failed to get recent files",
+    getWorkspaceFiles: "Failed to get workspace files",
+    getRunningNotebooks: "Failed to get running notebooks",
+    shutdownSession: "Failed to shutdown session",
+    getExportAvailability: "", // No toast
+    installExportRequirements: "Failed to install export requirements",
+    exportAsHTML: "Failed to export HTML",
+    exportAsIPYNB: "Failed to export ipynb",
+    exportAsMarkdown: "Failed to export Markdown",
+    exportAsScript: "Failed to export Script",
+    exportAsPDF: "Failed to export PDF",
+    autoExportAsHTML: "", // No toast
+    autoExportAsMarkdown: "", // No toast
+    autoExportAsIPYNB: "", // No toast
+    updateCellOutputs: "", // No toast
+    addPackage: "Failed to add package",
+    removePackage: "Failed to remove package",
+    getPackageList: "Failed to get package list",
+    getSandbox: "",
+    updateManifest: "",
+    syncSandbox: "",
+    getDependencyTree: "Failed to get dependency tree",
+    listSecretKeys: "Failed to fetch secrets",
+    writeSecret: "Failed to write secret",
+    invokeAiTool: "Failed to invoke AI tool",
+    clearCache: "Failed to clear cache",
+    getCacheInfo: "", // No toast
+    listStorageEntries: "Failed to list storage entries",
+    downloadStorage: "Failed to download storage entry",
+  };
+
+  const handlers = {} as EditRequests & RunRequests;
+  for (const [key, handler] of Object.entries(delegate)) {
+    const keyString = key as RequestKey;
+    handlers[keyString] = async (...args: any[]) => {
+      try {
+        return await handler(...args);
+      } catch (error) {
+        // A capability 403: the connection is read-only for this action. The
+        // live capability notification already moved the UI to viewer state,
+        // so don't alarm the user with an error toast.
+        if (error instanceof HTTPError && error.status === 403) {
+          Logger.warn(`Request refused, connection is read-only: ${key}`);
+          throw error;
+        }
+
+        const title = MESSAGES[keyString];
+        const message = prettyError(error);
+        if (title) {
+          toast({
+            title: title,
+            description: message,
+            variant: "danger",
+          });
+        }
+        Logger.error(`Failed to handle request: ${key}`, error);
+        // Rethrow the error so that the caller can handle it
+        throw error;
+      }
+    };
+  }
+
+  return handlers;
+}

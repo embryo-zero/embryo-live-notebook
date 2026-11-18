@@ -1,0 +1,261 @@
+/* Copyright 2026 Marimo. All rights reserved. */
+
+import { render } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import type { CellFreshness } from "@/core/executions";
+import { formatElapsedTime, type Milliseconds } from "@/utils/time";
+import {
+  CellStatusComponent,
+  ElapsedTime,
+} from "../components/editor/cell/CellStatus";
+
+// Mock date-fns to have consistent date formatting in tests
+vi.mock("date-fns", () => ({
+  formatDistanceToNow: () => "5 minutes",
+}));
+
+describe("formatElapsedTime", () => {
+  test("formats milliseconds correctly", () => {
+    expect(formatElapsedTime(500)).toBe("500ms");
+    expect(formatElapsedTime(50)).toBe("50ms");
+  });
+
+  test("formats seconds correctly", () => {
+    expect(formatElapsedTime(1500)).toBe("1.50s");
+    expect(formatElapsedTime(2340)).toBe("2.34s");
+  });
+
+  test("formats minutes and seconds correctly", () => {
+    expect(formatElapsedTime(60 * 1000)).toBe("1m0s");
+    expect(formatElapsedTime(90 * 1000)).toBe("1m30s");
+    expect(formatElapsedTime(89 * 1000)).toBe("1m29s");
+    expect(formatElapsedTime(91 * 1000)).toBe("1m31s");
+    expect(formatElapsedTime(150 * 1000)).toBe("2m30s");
+    expect(formatElapsedTime(151 * 1000)).toBe("2m31s");
+  });
+
+  test("handles null input", () => {
+    expect(formatElapsedTime(null)).toBe("");
+  });
+});
+
+describe("ElapsedTime component", () => {
+  test("renders elapsed time correctly", () => {
+    const { container } = render(
+      <TooltipProvider>
+        <ElapsedTime elapsedTime="1.50s" />
+      </TooltipProvider>,
+    );
+    expect(container).toMatchSnapshot();
+  });
+});
+
+describe("CellStatusComponent", () => {
+  // Mock date for consistent testing
+  const mockDate = new Date(2024, 0, 1, 12, 0, 0);
+  const originalDate = global.Date;
+
+  beforeEach(() => {
+    global.Date = class extends Date {
+      public static override now() {
+        return mockDate.getTime();
+      }
+    } as typeof Date;
+  });
+
+  afterEach(() => {
+    global.Date = originalDate;
+  });
+
+  // Base props that will be modified for different test cases
+  const baseProps = {
+    editing: true,
+    disabled: false,
+    freshness: { sourceChanged: false, inputsChanged: false } as CellFreshness,
+    status: "idle" as const,
+    interrupted: false,
+    elapsedTime: null,
+    startedAt: null,
+    blocked: false,
+    uninstantiated: false,
+  };
+
+  test("returns null when not editing", () => {
+    const { container } = render(
+      <TooltipProvider>
+        <CellStatusComponent {...baseProps} editing={false} />
+      </TooltipProvider>,
+    );
+    expect(container.firstChild).toBeNull();
+  });
+
+  test("renders disabled and stale state", () => {
+    const props = {
+      ...baseProps,
+      disabled: true,
+      freshness: { sourceChanged: false, inputsChanged: true } as CellFreshness,
+      startedAt: 1_704_096_000_000 as Milliseconds, // Jan 1, 2024 12:00:00
+    };
+
+    const { container } = render(
+      <TooltipProvider>
+        <CellStatusComponent {...props} />
+      </TooltipProvider>,
+    );
+    expect(container).toMatchSnapshot();
+  });
+
+  test("renders disabled state", () => {
+    const props = {
+      ...baseProps,
+      disabled: true,
+      startedAt: 1_704_096_000_000 as Milliseconds,
+    };
+
+    const { container } = render(
+      <TooltipProvider>
+        <CellStatusComponent {...props} />
+      </TooltipProvider>,
+    );
+    expect(container).toMatchSnapshot();
+  });
+
+  test("renders disabled transitively state", () => {
+    const props = {
+      ...baseProps,
+      blocked: true,
+      startedAt: 1_704_096_000_000 as Milliseconds,
+    };
+
+    const { container } = render(
+      <TooltipProvider>
+        <CellStatusComponent {...props} />
+      </TooltipProvider>,
+    );
+    expect(container).toMatchSnapshot();
+  });
+
+  test("renders stale and disabled transitively state", () => {
+    const props = {
+      ...baseProps,
+      blocked: true,
+      freshness: { sourceChanged: false, inputsChanged: true } as CellFreshness,
+      startedAt: 1_704_096_000_000 as Milliseconds,
+    };
+
+    const { container } = render(
+      <TooltipProvider>
+        <CellStatusComponent {...props} />
+      </TooltipProvider>,
+    );
+    expect(container).toMatchSnapshot();
+  });
+
+  test("renders running state", () => {
+    const props = {
+      ...baseProps,
+      status: "running" as const,
+      startedAt: 1_704_096_000_000 as Milliseconds,
+    };
+
+    const { container } = render(
+      <TooltipProvider>
+        <CellStatusComponent {...props} />
+      </TooltipProvider>,
+    );
+    expect(container).toMatchSnapshot();
+  });
+
+  test("renders queued state", () => {
+    const props = {
+      ...baseProps,
+      status: "queued" as const,
+      startedAt: 1_704_096_000_000 as Milliseconds,
+    };
+
+    const { container } = render(
+      <TooltipProvider>
+        <CellStatusComponent {...props} />
+      </TooltipProvider>,
+    );
+    expect(container).toMatchSnapshot();
+  });
+
+  test("renders uninstantiated state", () => {
+    const props = {
+      ...baseProps,
+      uninstantiated: true,
+    };
+
+    const { container } = render(
+      <TooltipProvider>
+        <CellStatusComponent {...props} />
+      </TooltipProvider>,
+    );
+    expect(container).toMatchSnapshot();
+  });
+
+  test("renders interrupted state", () => {
+    const props = {
+      ...baseProps,
+      interrupted: true,
+      elapsedTime: 1500 as Milliseconds,
+      startedAt: 1_704_096_000_000 as Milliseconds,
+    };
+
+    const { container } = render(
+      <TooltipProvider>
+        <CellStatusComponent {...props} />
+      </TooltipProvider>,
+    );
+    expect(container).toMatchSnapshot();
+  });
+
+  test("renders edited state", () => {
+    const props = {
+      ...baseProps,
+      freshness: { sourceChanged: true, inputsChanged: false } as CellFreshness,
+      elapsedTime: 1500 as Milliseconds,
+      startedAt: 1_704_096_000_000 as Milliseconds,
+    };
+
+    const { container } = render(
+      <TooltipProvider>
+        <CellStatusComponent {...props} />
+      </TooltipProvider>,
+    );
+    expect(container).toMatchSnapshot();
+  });
+
+  test("renders stale inputs state", () => {
+    const props = {
+      ...baseProps,
+      freshness: { sourceChanged: false, inputsChanged: true } as CellFreshness,
+      elapsedTime: 1500 as Milliseconds,
+      startedAt: 1_704_096_000_000 as Milliseconds,
+    };
+
+    const { container } = render(
+      <TooltipProvider>
+        <CellStatusComponent {...props} />
+      </TooltipProvider>,
+    );
+    expect(container).toMatchSnapshot();
+  });
+
+  test("renders completed run with elapsed time", () => {
+    const props = {
+      ...baseProps,
+      elapsedTime: 1500 as Milliseconds,
+      startedAt: 1_704_096_000_000 as Milliseconds,
+    };
+
+    const { container } = render(
+      <TooltipProvider>
+        <CellStatusComponent {...props} />
+      </TooltipProvider>,
+    );
+    expect(container).toMatchSnapshot();
+  });
+});

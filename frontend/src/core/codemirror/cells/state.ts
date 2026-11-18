@@ -1,0 +1,34 @@
+/* Copyright 2026 Marimo. All rights reserved. */
+
+import { Facet } from "@codemirror/state";
+import type { CellActions } from "@/core/cells/actions";
+import type { CellId } from "@/core/cells/ids";
+
+export interface CodemirrorCellActions extends CellActions {
+  toggleHideCode: () => boolean;
+  askAiAboutCell: () => void;
+  aiCellCompletion: () => boolean;
+  createManyBelow: (content: string[]) => void;
+  onRun: () => void;
+  deleteCell: () => void;
+  afterToggleMarkdown: () => void;
+  afterToggleSQL: () => void;
+  saveNotebook: () => void;
+}
+
+/**
+ * State for cell actions
+ */
+export const cellActionsState = Facet.define<
+  CodemirrorCellActions,
+  CodemirrorCellActions
+>({
+  combine: (values) => values[0],
+});
+
+/**
+ * State for cell id
+ */
+export const cellIdState = Facet.define<CellId, CellId>({
+  combine: (values) => values[0],
+});

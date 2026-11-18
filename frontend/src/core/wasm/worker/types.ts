@@ -1,0 +1,136 @@
+/* Copyright 2026 Marimo. All rights reserved. */
+import type { PyodideInterface } from "pyodide";
+import type { WasmRuntimeConfig } from "../runtime-config";
+import type { UserConfig } from "@/core/config/config-schema";
+import type { ClientCommand } from "@/core/kernel/messages";
+import type {
+  CodeCompletionRequest,
+  CopyNotebookRequest,
+  EnvironmentInfo,
+  ExportAsHTMLRequest,
+  ExportAsMarkdownRequest,
+  ExportAsScriptRequest,
+  ExportedFile,
+  FileCopyRequest,
+  FileCopyResponse,
+  FileCreateRequest,
+  FileCreateResponse,
+  FileDeleteRequest,
+  FileDeleteResponse,
+  FileDetailsResponse,
+  FileListRequest,
+  FileListResponse,
+  FileRootsResponse,
+  FileMoveRequest,
+  FileMoveResponse,
+  FileSearchRequest,
+  FileSearchResponse,
+  FileUpdateRequest,
+  FileUpdateResponse,
+  FormatCellsRequest,
+  FormatResponse,
+  SaveAppConfigurationRequest,
+  SaveUserConfigurationRequest,
+  Snippets,
+} from "../../network/types";
+
+export interface WasmController {
+  /**
+   * Prepare the wasm environment
+   * @param opts.version - The marimo version
+   */
+  bootstrap(
+    opts: WasmRuntimeConfig & {
+      pyodideVersion: string;
+    },
+  ): Promise<PyodideInterface>;
+  /**
+   * Mount the filesystem
+   * @param opts.code - The code to mount
+   * @param opts.filename - The filename to mount, if any
+   */
+  mountFilesystem(opts: {
+    code: string;
+    filename: string | null;
+  }): Promise<{ code: string; filename: string }>;
+  /** Prepare a session and load its dependencies without executing cells. */
+  prepareSession(opts: {
+    queryParameters: Record<string, string | string[]>;
+    code: string;
+    filename: string | null;
+    userConfig: UserConfig;
+  }): Promise<WasmSession>;
+}
+
+export interface WasmSession {
+  readonly bridge: SerializedBridge;
+  /** Start once dependencies are ready. Repeated calls share the same start. */
+  start(): Promise<void>;
+  /** Prevent a pending start and release the session and its bridge. */
+  stop(): Promise<void>;
+}
+
+export interface RawBridge {
+  put_control_request(operation: ClientCommand): Promise<string>;
+  code_complete(request: CodeCompletionRequest): Promise<string>;
+  read_code(): Promise<{ contents: string }>;
+  read_snippets(): Promise<Snippets>;
+  get_environment_info(): Promise<EnvironmentInfo>;
+  format(request: FormatCellsRequest): Promise<FormatResponse>;
+  copy(request: CopyNotebookRequest): Promise<string>;
+  save_app_config(request: SaveAppConfigurationRequest): Promise<string>;
+  save_user_config(request: SaveUserConfigurationRequest): Promise<null>;
+  rename_file(request: string): Promise<string>;
+  list_files(request: FileListRequest): Promise<FileListResponse>;
+  file_roots(): Promise<FileRootsResponse>;
+  search_files(request: FileSearchRequest): Promise<FileSearchResponse>;
+  file_details(request: { path: string }): Promise<FileDetailsResponse>;
+  create_file_or_directory(
+    request: FileCreateRequest,
+  ): Promise<FileCreateResponse>;
+  delete_file_or_directory(
+    request: FileDeleteRequest,
+  ): Promise<FileDeleteResponse>;
+  copy_file_or_directory(request: FileCopyRequest): Promise<FileCopyResponse>;
+  move_file_or_directory(request: FileMoveRequest): Promise<FileMoveResponse>;
+  update_file(request: FileUpdateRequest): Promise<FileUpdateResponse>;
+  load_packages(request: string): Promise<string>;
+  read_file(request: string): Promise<string>;
+  set_interrupt_buffer(request: Uint8Array): Promise<string>;
+  export_html(request: ExportAsHTMLRequest): Promise<ExportedFile<string>>;
+  export_markdown(
+    request: ExportAsMarkdownRequest,
+  ): Promise<ExportedFile<string>>;
+  export_script(request: ExportAsScriptRequest): Promise<ExportedFile<string>>;
+}
+
+export type BridgePayload<T extends keyof RawBridge> = T extends keyof RawBridge
+  ? Parameters<RawBridge[T]>[0]
+  : undefined;
+
+export type SerializedBridge = {
+  [P in keyof RawBridge]: RawBridge[P] extends (
+    payload: string,
+  ) => Promise<unknown>
+    ? (payload: string) => Promise<string>
+    : RawBridge[P];
+} & {
+  notebook: {
+    readonly id: string;
+    subscribe(
+      id: string,
+      cursor: string | null,
+      emit: (event: string) => void,
+    ): Promise<void>;
+    unsubscribe(id: string): void;
+    call(call: string): Promise<string>;
+    transaction(request: string): Promise<void>;
+    set_layout(layout: string): Promise<void>;
+    set_persistence(
+      persist: (contents: string, filename: string) => Promise<void>,
+    ): void;
+    set_package_loader(load: (code: string) => Promise<void>): void;
+    allow_input(allowed: boolean): void;
+    destroy(): void;
+  };
+};

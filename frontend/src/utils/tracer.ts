@@ -1,0 +1,116 @@
+/* Copyright 2026 Marimo. All rights reserved. */
+
+/* oxlint-disable no-console -- for debugging */
+
+import { Logger } from "./Logger";
+
+type SpanStatus = "ok" | "error";
+
+interface Span {
+  name: string;
+  startTime: number;
+  endTime?: number;
+  status?: SpanStatus;
+  attributes: Record<string, unknown>;
+  end: (status?: SpanStatus) => void;
+}
+
+/**
+ * Extremely simple tracer for measuring performance of code.
+ */
+export class Tracer {
+  private spans: Span[] = [];
+
+  public startSpan(
+    name: string,
+    attributes: Record<string, unknown> = {},
+  ): Span {
+    const span: Span = {
+      name,
+      startTime: Date.now(),
+      attributes,
+      end: (status: SpanStatus = "ok") => this.endSpan(span, status),
+    };
+    this.spans.push(span);
+    return span;
+  }
+
+  public endSpan(span: Span, status: SpanStatus = "ok"): void {
+    span.endTime = Date.now();
+    span.status = status;
+  }
+
+  public getSpans(): Span[] {
+    return this.spans;
+  }
+
+  public wrap<T>(
+    fn: () => T,
+    name?: string,
+    attributes: Record<string, unknown> = {},
+  ): T {
+    const span = this.startSpan(name || fn.name, attributes);
+    try {
+      const result = fn();
+      this.endSpan(span);
+      return result;
+    } catch (error) {
+      this.endSpan(span, "error");
+      throw error;
+    }
+  }
+
+  public wrapAsync<T extends (...args: never[]) => Promise<unknown>>(
+    fn: T,
+    name?: string,
+    attributes?: Record<string, unknown>,
+  ): T;
+  public wrapAsync<Args extends unknown[], Result>(
+    fn: (...args: Args) => Promise<Result>,
+    name?: string,
+    attributes: Record<string, unknown> = {},
+  ): (...args: Args) => Promise<Result> {
+    return async (...args) => {
+      const span = this.startSpan(name || fn.name, attributes);
+      try {
+        const result = await fn(...args);
+        this.endSpan(span);
+        return result;
+      } catch (error) {
+        this.endSpan(span, "error");
+        throw error;
+      }
+    };
+  }
+
+  public logSpans(): void {
+    if (process.env.NODE_ENV !== "development") {
+      return;
+    }
+
+    this.spans.forEach((span) => {
+      // oxlint-disable-next-line no-console -- intentional tracing output
+      console.log(`Span: ${span.name}`);
+      const childSpans = this.spans.filter(
+        (s) =>
+          s.startTime > span.startTime &&
+          span.endTime &&
+          s.startTime < span.endTime,
+      );
+      if (childSpans.length > 0) {
+        Logger.log("Child Spans:");
+        childSpans.forEach((childSpan) => {
+          Logger.log(`  - ${childSpan.name}`);
+        });
+      }
+      Logger.log(`Start Time: ${new Date(span.startTime).toISOString()}`);
+      if (span.endTime) {
+        Logger.log(`End Time: ${new Date(span.endTime).toISOString()}`);
+        Logger.log(`Duration: ${span.endTime - span.startTime}ms`);
+      }
+      Logger.log(`Status: ${span.status}`);
+      Logger.log(`Attributes: ${JSON.stringify(span.attributes)}`);
+      Logger.log("---");
+    });
+  }
+}

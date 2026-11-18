@@ -1,0 +1,237 @@
+/* Copyright 2026 Marimo. All rights reserved. */
+
+import { Logger } from "./Logger";
+import { memoizeLastValue } from "./once";
+
+/**
+ * Browsers have a limit on the maximum number of fractional digits they can display.
+ * This function finds the maximum number of fractional digits that can be displayed for a given locale.
+ */
+export const maxFractionalDigits = memoizeLastValue((locale: string) => {
+  const options = [100, 20, 2, 0];
+  for (const option of options) {
+    try {
+      new Intl.NumberFormat(locale, {
+        minimumFractionDigits: 0,
+        maximumFractionDigits: option,
+      }).format(1);
+      return option;
+    } catch (error) {
+      Logger.error(error);
+    }
+  }
+  return 0;
+});
+
+const getScientificFormatter = memoizeLastValue(
+  (locale: string, maximumFractionDigits = 1) =>
+    new Intl.NumberFormat(locale, {
+      minimumFractionDigits: 1,
+      maximumFractionDigits,
+      notation: "scientific",
+    }),
+);
+
+const getRoundedFormatter = memoizeLastValue(
+  (locale: string, maximumFractionDigits = 2) =>
+    new Intl.NumberFormat(locale, {
+      minimumFractionDigits: 0,
+      maximumFractionDigits,
+    }),
+);
+
+const getEngineeringFormatter = memoizeLastValue(
+  (locale: string) =>
+    new Intl.NumberFormat(locale, {
+      notation: "engineering",
+      maximumSignificantDigits: 3,
+    }),
+);
+
+/** Decimal places needed to display `n` without float noise. */
+export function countFractionDigits(n: number): number {
+  if (!Number.isFinite(n) || n === 0) {
+    return 0;
+  }
+  const normalized = n.toFixed(12).replace(/\.?0+$/, "");
+  const dot = normalized.indexOf(".");
+  return dot === -1 ? 0 : normalized.length - dot - 1;
+}
+
+/** Max fraction digits to display a set of step values cleanly. */
+export function maxFractionDigitsForSteps(
+  steps: readonly number[],
+  minGap: number,
+): number {
+  let max = countFractionDigits(minGap);
+  for (const step of steps) {
+    max = Math.max(max, countFractionDigits(step));
+  }
+  return max;
+}
+
+/** Infer display precision from a slider's regular or custom steps. */
+export function fractionDigitsForSlider(
+  step?: number,
+  steps?: readonly number[] | null,
+  origin?: number,
+  values?: readonly number[],
+): number {
+  const originDigits = origin == null ? 0 : countFractionDigits(origin);
+
+  if (steps && steps.length > 0) {
+    let minGap = Number.POSITIVE_INFINITY;
+    for (let i = 1; i < steps.length; i++) {
+      const gap = Math.abs(steps[i] - steps[i - 1]);
+      if (gap > 0 && gap < minGap) {
+        minGap = gap;
+      }
+    }
+
+    return Math.max(
+      originDigits,
+      maxFractionDigitsForSteps(steps, Number.isFinite(minGap) ? minGap : 0),
+    );
+  }
+
+  if (step == null || !Number.isFinite(step) || step <= 0) {
+    return Math.max(
+      2,
+      originDigits,
+      ...(values ?? []).map(countFractionDigits),
+    );
+  }
+
+  return Math.max(originDigits, countFractionDigits(step));
+}
+
+/** Round away float noise so step-based inputs stay on a clean decimal grid. */
+export function roundToFractionDigits(n: number, digits: number): number {
+  return Number(n.toFixed(digits));
+}
+
+export function prettyNumber(value: unknown, locale: string): string {
+  if (value === undefined || value === null) {
+    return "";
+  }
+
+  if (Array.isArray(value)) {
+    return String(value);
+  }
+
+  if (typeof value === "string") {
+    return value;
+  }
+
+  if (typeof value === "boolean") {
+    return String(value);
+  }
+
+  if (typeof value === "number" || typeof value === "bigint") {
+    return value.toLocaleString(locale, {
+      minimumFractionDigits: 0,
+      maximumFractionDigits: 2,
+    });
+  }
+
+  return String(value);
+}
+
+function scientificSpecialCase(value: number): string | null {
+  if (value === 0) {
+    return "0";
+  } // Avoid displaying -0
+  if (Number.isNaN(value)) {
+    return "NaN";
+  }
+  if (!Number.isFinite(value)) {
+    return value > 0 ? "Infinity" : "-Infinity";
+  }
+
+  // No special case
+  return null;
+}
+
+export function prettyScientificNumber(
+  value: number,
+  opts: {
+    shouldRound?: boolean; // Default to false
+    maximumFractionDigits?: number;
+    locale: string;
+  },
+): string {
+  // Handle special cases first
+  const specialCase = scientificSpecialCase(value);
+  if (specialCase !== null) {
+    return specialCase;
+  }
+
+  // Determine if the number should be in scientific notation
+  const absValue = Math.abs(value);
+  if (absValue < 1e-2 || absValue >= 1e6) {
+    // Scientific notation counts digits after the decimal in the mantissa.
+    const digits =
+      opts.maximumFractionDigits === undefined
+        ? 1
+        : Math.max(
+            1,
+            Math.min(
+              maxFractionalDigits(opts.locale),
+              opts.maximumFractionDigits + Math.floor(Math.log10(absValue)),
+            ),
+          );
+    return getScientificFormatter(opts.locale, digits)
+      .format(value)
+      .toLowerCase();
+  }
+
+  const { shouldRound, locale } = opts;
+
+  if (shouldRound || opts.maximumFractionDigits !== undefined) {
+    return getRoundedFormatter(locale, opts.maximumFractionDigits ?? 2).format(
+      value,
+    );
+  }
+
+  // Don't round
+  return value.toLocaleString(locale, {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: maxFractionalDigits(locale),
+  });
+}
+
+const prefixes = {
+  "24": "Y",
+  "21": "Z",
+  "18": "E",
+  "15": "P",
+  "12": "T",
+  "9": "G",
+  "6": "M",
+  "3": "k",
+  "0": "",
+  "-3": "m",
+  "-6": "µ",
+  "-9": "n",
+  "-12": "p",
+  "-15": "f",
+  "-18": "a",
+  "-21": "z",
+  "-24": "y",
+};
+
+export function prettyEngineeringNumber(value: number, locale: string): string {
+  // Handle special cases first
+  const specialCase = scientificSpecialCase(value);
+  if (specialCase !== null) {
+    return specialCase;
+  }
+
+  const [mant, exp] = getEngineeringFormatter(locale).format(value).split("E");
+
+  if (exp in prefixes) {
+    return mant + prefixes[exp as keyof typeof prefixes];
+  }
+
+  return `${mant}E${exp}`;
+}

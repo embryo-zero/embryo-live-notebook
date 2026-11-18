@@ -1,0 +1,219 @@
+# Copyright 2026 Marimo. All rights reserved.
+from __future__ import annotations
+
+import asyncio
+import sys
+from typing import TYPE_CHECKING
+from uuid import uuid4
+
+import msgspec
+
+from marimo import _loggers
+from marimo._messaging.cell_output import CellOutput
+from marimo._messaging.input import InputReply, require_active_execution
+from marimo._messaging.mimetypes import ConsoleMimeType
+from marimo._messaging.notification import CellNotification
+from marimo._messaging.notification_utils import broadcast_notification
+from marimo._messaging.streams import std_stream_max_bytes
+from marimo._messaging.types import (
+    KernelMessage,
+    Stderr,
+    Stdin,
+    Stdout,
+    Stream,
+)
+from marimo._types.ids import CellId_t
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable
+
+LOGGER = _loggers.marimo_logger()
+
+
+class PyodideStream(Stream):
+    """A thread-safe wrapper around a pipe."""
+
+    def __init__(
+        self,
+        pipe: Callable[[KernelMessage], None],
+        input_queue: asyncio.Queue[InputReply],
+        cell_id: CellId_t | None = None,
+    ):
+        self.pipe = pipe
+        self.cell_id = cell_id
+        self.input_queue = input_queue
+        self.input_lock = asyncio.Lock()
+
+    def write(self, data: KernelMessage) -> None:
+        self.pipe(data)
+
+    def copy_for_thread(self) -> PyodideStream:
+        stream = PyodideStream(
+            pipe=self.pipe,
+            input_queue=self.input_queue,
+            cell_id=self.cell_id,
+        )
+        stream.input_lock = self.input_lock
+        return stream
+
+
+class PyodideStdout(Stdout):
+    encoding = sys.stdout.encoding
+    errors = sys.stdout.errors
+    _fileno: int | None = None
+
+    def __init__(self, stream: Stream) -> None:
+        self.stream = stream
+
+    def writable(self) -> bool:
+        return True
+
+    def readable(self) -> bool:
+        return False
+
+    def seekable(self) -> bool:
+        return False
+
+    def _write_with_mimetype(
+        self, data: str, mimetype: ConsoleMimeType
+    ) -> int:
+        assert self.stream.cell_id is not None
+        if not isinstance(data, str):
+            raise TypeError(
+                f"write() argument must be a str, not {type(data).__name__}"
+            )
+        max_bytes = std_stream_max_bytes()
+        if sys.getsizeof(data) > max_bytes:
+            sys.stderr.write(
+                "Warning: marimo truncated a very large console output.\n"
+            )
+            data = data[: int(max_bytes)] + " ... "
+        broadcast_notification(
+            CellNotification(
+                cell_id=self.stream.cell_id,
+                console=CellOutput.stdout(data, mimetype),
+            ),
+            self.stream,
+        )
+        return len(data)
+
+    # Buffer type not available python < 3.12, hence type ignore
+    def writelines(self, sequence: Iterable[str]) -> None:  # type: ignore[override]
+        for line in sequence:
+            self.write(line)
+
+
+class PyodideStderr(Stderr):
+    encoding = sys.stderr.encoding
+    errors = sys.stderr.errors
+    _fileno: int | None = None
+
+    def __init__(self, stream: Stream) -> None:
+        self.stream = stream
+
+    def writable(self) -> bool:
+        return True
+
+    def readable(self) -> bool:
+        return False
+
+    def seekable(self) -> bool:
+        return False
+
+    def _write_with_mimetype(
+        self,
+        data: str,
+        mimetype: ConsoleMimeType,
+        *,
+        code: str | None = None,
+    ) -> int:
+        assert self.stream.cell_id is not None
+        if not isinstance(data, str):
+            raise TypeError(
+                f"write() argument must be a str, not {type(data).__name__}"
+            )
+        max_bytes = std_stream_max_bytes()
+        if sys.getsizeof(data) > max_bytes:
+            data = (
+                "Warning: marimo truncated a very large console output.\n"
+                + data[: int(max_bytes)]
+                + " ... "
+            )
+
+        broadcast_notification(
+            CellNotification(
+                cell_id=self.stream.cell_id,
+                console=CellOutput.stderr(
+                    data,
+                    mimetype,
+                    code=code if code is not None else msgspec.UNSET,
+                ),
+            ),
+            self.stream,
+        )
+        return len(data)
+
+    def writelines(self, sequence: Iterable[str]) -> None:  # type: ignore[override]
+        for line in sequence:
+            self.write(line)
+
+
+class PyodideStdin(Stdin):
+    encoding = sys.stdin.encoding
+    errors = sys.stdin.errors
+
+    def __init__(self, stream: PyodideStream):
+        self.stream = stream
+
+    def writable(self) -> bool:
+        return False
+
+    def readable(self) -> bool:
+        return True
+
+    def _readline_with_prompt(
+        self, prompt: str = "", password: bool = False
+    ) -> str:
+        """Read input from the standard in stream, with an optional prompt."""
+        return asyncio.get_event_loop().run_until_complete(
+            self._read_input(prompt, password)
+        )
+
+    async def _read_input(self, prompt: str, password: bool) -> str:
+        async with self.stream.input_lock:
+            require_active_execution()
+            assert self.stream.cell_id is not None
+            if not isinstance(prompt, str):
+                raise TypeError(
+                    f"prompt must be a str, not {type(prompt).__name__}"
+                )
+            max_bytes = std_stream_max_bytes()
+            if sys.getsizeof(prompt) > max_bytes:
+                prompt = (
+                    "Warning: marimo truncated a very large console output.\n"
+                    + prompt[: int(max_bytes)]
+                    + " ... "
+                )
+
+            input_id = str(uuid4())
+            broadcast_notification(
+                CellNotification(
+                    cell_id=self.stream.cell_id,
+                    console=CellOutput.stdin(
+                        prompt, password=password, input_id=input_id
+                    ),
+                ),
+                self.stream,
+            )
+
+            while True:
+                require_active_execution()
+                try:
+                    reply = await asyncio.wait_for(
+                        self.stream.input_queue.get(), timeout=0.1
+                    )
+                except TimeoutError:
+                    continue
+                require_active_execution()
+                if reply.input_id == input_id:
+                    return reply.value

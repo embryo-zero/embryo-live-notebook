@@ -1,0 +1,223 @@
+/* Copyright 2026 Marimo. All rights reserved. */
+
+import { usePrevious } from "@dnd-kit/utilities";
+import { Tooltip } from "radix-ui";
+
+const TooltipProvider = Tooltip.Provider;
+
+import { useAtomValue } from "jotai";
+import { lazy, useEffect } from "react";
+import { Controls } from "@/components/editor/controls/Controls";
+import { SandboxController } from "@/components/editor/chrome/panels/sandbox-controller";
+import { ConnectionNotice } from "@/components/editor/alerts/connection-notice";
+import { FilenameForm } from "@/components/editor/header/filename-form";
+import { MultiCellActionToolbar } from "@/components/editor/navigation/multi-cell-action-toolbar";
+import { ViewerBanner } from "@/components/editor/viewer-banner";
+import { ProgressiveBoundary } from "@/components/lifecycle/ProgressiveBoundary";
+import { cn } from "@/utils/cn";
+import { Paths } from "@/utils/paths";
+import { AppContainer } from "../components/editor/app-container";
+import {
+  useRunAllCells,
+  useRunStaleCells,
+} from "../components/editor/cell/useRunCells";
+import { useSetCodeVisibility } from "../components/editor/actions/useSetCodeVisibility";
+import { useSetOutputsExpanded } from "../components/editor/actions/useSetOutputsExpanded";
+import { CellArray } from "../components/editor/renderers/cell-array";
+import { CellsRenderer } from "../components/editor/renderers/cells-renderer";
+import { useHotkey } from "../hooks/useHotkey";
+import { hasCellsAtom } from "./cells/cells";
+import { interruptRuntime, notebookIsRunningAtom } from "./executions";
+import { store } from "./state/jotai";
+import { numColumnsAtom } from "./cells/layout";
+import { useCellActions } from "./cells/actions";
+import type { AppConfig, UserConfig } from "./config/config-schema";
+import { RuntimeState } from "./kernel/RuntimeState";
+import { useTogglePresenting } from "./layout/useTogglePresenting";
+import { viewStateAtom } from "./mode";
+import { useRequestClient } from "./network/requests";
+import { useFilename } from "./saving/filename";
+import type { ConnectionStatus } from "./session/types";
+
+const LazyCommandPalette = lazy(
+  () => import("../components/editor/controls/command-palette"),
+);
+
+export interface EditAppProps {
+  /**
+   * The user config.
+   */
+  userConfig: UserConfig;
+  /**
+   * The app config.
+   */
+  appConfig: AppConfig;
+  /**
+   * If true, the floating controls will be hidden.
+   */
+  hideControls?: boolean;
+  /** The session's connection, which the page owns with the document model. */
+  connection: ConnectionStatus;
+  reconnect: () => Promise<void>;
+}
+
+/** The notebook editor. Rendered inside the page's `DocumentProvider`. */
+export const EditApp: React.FC<EditAppProps> = ({
+  userConfig,
+  appConfig,
+  hideControls = false,
+  connection,
+  reconnect,
+}) => {
+  const { mergeAllColumns, collapseAllCells, expandAllCells } =
+    useCellActions();
+  const viewState = useAtomValue(viewStateAtom);
+  const numColumns = useAtomValue(numColumnsAtom);
+  const filename = useFilename();
+  const { sendComponentValues } = useRequestClient();
+
+  const isEditing = viewState.mode === "edit";
+  const isPresenting = viewState.mode === "present";
+  const isRunning = useAtomValue(notebookIsRunningAtom);
+
+  // Initialize RuntimeState event-listeners
+  useEffect(() => {
+    RuntimeState.INSTANCE.start(sendComponentValues);
+    return () => {
+      RuntimeState.INSTANCE.stop();
+    };
+  }, [sendComponentValues]);
+
+  // Update document title whenever filename or app_title changes
+  useEffect(() => {
+    // Set document title: app_title takes precedence, then filename, then default
+    document.title =
+      appConfig.app_title ||
+      Paths.basename(filename ?? "") ||
+      "Untitled Notebook";
+  }, [appConfig.app_title, filename]);
+
+  // Delete column breakpoints if app width changes from "columns"
+  const previousWidth = usePrevious(appConfig.width);
+  useEffect(() => {
+    if (previousWidth === "columns" && appConfig.width !== "columns") {
+      mergeAllColumns();
+    }
+  }, [appConfig.width, previousWidth, mergeAllColumns, numColumns]);
+
+  const runStaleCells = useRunStaleCells();
+  const runAllCells = useRunAllCells();
+  const togglePresenting = useTogglePresenting();
+  const setCodeVisibility = useSetCodeVisibility();
+  const setOutputsExpanded = useSetOutputsExpanded();
+
+  // HOTKEYS
+  useHotkey("global.runStale", () => {
+    runStaleCells();
+  });
+  useHotkey("global.interrupt", () => {
+    void interruptRuntime(store);
+  });
+  useHotkey("global.hideCode", () => {
+    togglePresenting();
+  });
+  useHotkey("global.runAll", () => {
+    runAllCells();
+  });
+  useHotkey("global.showAllCode", () => {
+    setCodeVisibility(false, "code");
+  });
+  useHotkey("global.hideAllCode", () => {
+    setCodeVisibility(true, "code");
+  });
+  useHotkey("global.showAllMarkdownCode", () => {
+    setCodeVisibility(false, "markdown");
+  });
+  useHotkey("global.hideAllMarkdownCode", () => {
+    setCodeVisibility(true, "markdown");
+  });
+  useHotkey(
+    "global.expandAllOutputs",
+    () => {
+      setOutputsExpanded(true);
+    },
+    { disabled: !isEditing },
+  );
+  useHotkey(
+    "global.clampAllOutputs",
+    () => {
+      setOutputsExpanded(false);
+    },
+    { disabled: !isEditing },
+  );
+  useHotkey("global.collapseAllSections", () => {
+    collapseAllCells();
+  });
+  useHotkey("global.expandAllSections", () => {
+    expandAllCells();
+  });
+
+  const editableCellsArray = (
+    <CellArray
+      mode={viewState.mode}
+      userConfig={userConfig}
+      appConfig={appConfig}
+      hideControls={hideControls}
+    />
+  );
+
+  return (
+    <>
+      <SandboxController onReconnect={reconnect} />
+      <AppContainer
+        connection={connection}
+        isRunning={isRunning}
+        width={appConfig.width}
+        onReconnect={reconnect}
+      >
+        <ViewerBanner />
+        <div
+          className={cn(
+            "pt-4 sm:pt-12 pb-6 print:hidden z-50",
+            // Keep the header sticky when scrolling horizontally, for column mode
+            "sticky left-0",
+          )}
+        >
+          {!hideControls && isEditing && (
+            <div className="flex items-center justify-center container">
+              <FilenameForm filename={filename} />
+            </div>
+          )}
+        </div>
+
+        <ConnectionNotice
+          appConfig={appConfig}
+          onRetry={reconnect}
+          canOpenPackages={!hideControls}
+        />
+
+        {/* Don't render until we have a single cell. */}
+        <ProgressiveBoundary requires={hasCellsAtom}>
+          <CellsRenderer appConfig={appConfig} mode={viewState.mode}>
+            {editableCellsArray}
+          </CellsRenderer>
+        </ProgressiveBoundary>
+      </AppContainer>
+      <MultiCellActionToolbar />
+      {!hideControls && (
+        <TooltipProvider>
+          <Controls
+            presenting={isPresenting}
+            onTogglePresenting={togglePresenting}
+            onInterrupt={() => interruptRuntime(store)}
+            onRun={runStaleCells}
+            connectionState={connection.state}
+            running={isRunning}
+            appConfig={appConfig}
+          />
+        </TooltipProvider>
+      )}
+      <LazyCommandPalette />
+    </>
+  );
+};

@@ -1,0 +1,52 @@
+import marimo
+
+app = marimo.App()
+
+
+@app.cell
+def _():
+    # Cell tags: tag1, tag2
+    print("Hello")
+
+
+@app.cell
+def _():
+    print("World")
+
+
+@app.cell
+def _():
+    # Cell tags: data-processing, important
+    print("Cell 1")
+
+
+@app.cell
+def _():
+    print("Cell 2")
+
+
+@app.cell
+def _():
+    # Cell tags: visualization
+    print("Cell 3")
+
+
+@app.cell
+def _():
+    # Cell tags: tag1, tag2
+    print("Complex metadata")
+
+
+@app.cell(hide_code=True)
+def _():
+    print("hidden cell")
+
+
+@app.cell(hide_code=True)
+def _():
+    # Cell tags: remove-print
+    print("hidden cell, with other tags")
+
+
+if __name__ == "__main__":
+    app.run()

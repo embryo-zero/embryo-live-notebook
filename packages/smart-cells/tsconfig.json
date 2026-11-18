@@ -1,0 +1,11 @@
+{
+  "extends": "@marimo-team/tsconfig/library.json",
+  "compilerOptions": {
+    "lib": ["ESNext"],
+    "types": ["node", "@marimo-team/tsconfig/ts-reset"],
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "allowImportingTsExtensions": true,
+    "noEmit": true
+  }
+}

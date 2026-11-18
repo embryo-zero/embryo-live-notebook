@@ -1,0 +1,378 @@
+/* Copyright 2026 Marimo. All rights reserved. */
+
+import type { NotebookId } from "@marimo-team/client/protocol";
+import { Deferred } from "@/utils/Deferred";
+import { Logger } from "@/utils/Logger";
+import { KnownQueryParams } from "../constants";
+import { isIslands } from "../islands/utils";
+import { getSessionId, type SessionId } from "../kernel/session";
+import { isStaticNotebook } from "../static/static-state";
+import { isWasm } from "../wasm/utils";
+import type { RuntimeConfig } from "./types";
+
+const knownQueryParams = new Set(Object.values(KnownQueryParams));
+
+export class RuntimeManager {
+  private initialHealthyCheck = new Deferred<void>();
+  private config: RuntimeConfig;
+
+  public constructor(config: RuntimeConfig) {
+    this.config = config;
+    // Validate the URL on construction
+    try {
+      new URL(this.config.url);
+    } catch (error) {
+      throw new Error(
+        `Invalid runtime URL: ${this.config.url}. ${error instanceof Error ? error.message : "Unknown error"}`,
+        { cause: error },
+      );
+    }
+  }
+
+  public get httpURL(): URL {
+    return new URL(this.config.url);
+  }
+
+  public get isSameOrigin(): boolean {
+    return this.httpURL.origin === window.location.origin;
+  }
+
+  public get isServerless(): boolean {
+    return isWasm() || isIslands() || isStaticNotebook();
+  }
+
+  /**
+   * The base URL of the runtime.
+   */
+  public formatHttpURL({
+    path = "",
+    searchParams,
+    restrictToKnownQueryParams = true,
+  }: {
+    path?: string;
+    searchParams?: URLSearchParams;
+    restrictToKnownQueryParams?: boolean;
+  }): URL {
+    // URL may be something like "http://localhost:8000?auth=123"
+    const baseUrl = this.httpURL;
+    const currentParams = new URLSearchParams(window.location.search);
+    // Copy over search params if provided
+    if (searchParams) {
+      for (const [key, value] of searchParams.entries()) {
+        baseUrl.searchParams.set(key, value);
+      }
+    }
+
+    for (const [key, value] of currentParams.entries()) {
+      if (restrictToKnownQueryParams && !knownQueryParams.has(key)) {
+        continue;
+      }
+      baseUrl.searchParams.set(key, value);
+    }
+
+    const cleanPath = baseUrl.pathname.replace(/\/$/, "");
+    baseUrl.pathname = `${cleanPath}/${path.replace(/^\//, "")}`;
+    baseUrl.hash = "";
+    return baseUrl;
+  }
+
+  /**
+   * Channels that cannot send custom headers (WebSockets, and browser
+   * navigations such as file downloads) carry the auth token as a query
+   * param instead, but only when cross-origin. Same-origin requests
+   * authenticate via the session cookie, which keeps the token out of
+   * browser history and logs; cross-origin cookies are blocked by browsers,
+   * so the access_token query param is the only option there.
+   */
+  private appendCrossOriginAuth(url: URL): URL {
+    if (!this.isSameOrigin && this.config.authToken) {
+      url.searchParams.set(KnownQueryParams.accessToken, this.config.authToken);
+    }
+    return url;
+  }
+
+  /**
+   * An HTTP URL for requests made by browser navigation (e.g. anchor-click
+   * downloads), which cannot attach auth headers.
+   */
+  public formatNavigableHttpURL(
+    path: string,
+    searchParams?: URLSearchParams,
+  ): URL {
+    const url = this.formatHttpURL({ path, searchParams });
+    // Drop any token inherited from the current page's query params; re-add it
+    // only when cross-origin. Same-origin downloads authenticate via the
+    // session cookie, so a token in the URL would needlessly leak into
+    // proxy/server logs.
+    url.searchParams.delete(KnownQueryParams.accessToken);
+    return this.appendCrossOriginAuth(url);
+  }
+
+  public formatWsURL(path: string, searchParams?: URLSearchParams): URL {
+    // We don't restrict to known query parameters, since mo.query_params()
+    // can accept arbitrary parameters.
+    const url = this.formatHttpURL({
+      path,
+      searchParams,
+      restrictToKnownQueryParams: false,
+    });
+    return asWsUrl(this.appendCrossOriginAuth(url).toString());
+  }
+
+  /** Keep notebook page parameters separate from connection options. */
+  private getSessionURL(path: string, sessionId: SessionId): URL {
+    const url = this.formatHttpURL({ path });
+    const notebookParams = new URLSearchParams(this.httpURL.search);
+    const pageParams = new URLSearchParams(window.location.search);
+    for (const key of pageParams.keys()) {
+      notebookParams.delete(key);
+    }
+    for (const [key, value] of pageParams) {
+      notebookParams.append(key, value);
+    }
+    // These parameters are internal and are not exposed by mo.query_params().
+    notebookParams.delete(KnownQueryParams.accessToken);
+    notebookParams.delete("refresh_token");
+    notebookParams.delete(KnownQueryParams.sessionId);
+    url.searchParams.set("query_params", notebookParams.toString());
+    url.searchParams.set(KnownQueryParams.sessionId, sessionId);
+    return url;
+  }
+
+  /**
+   * The WebSocket URL of the runtime.
+   */
+  public getWsURL(sessionId: SessionId): URL {
+    const url = this.getSessionURL("/ws", sessionId);
+    return asWsUrl(this.appendCrossOriginAuth(url).toString());
+  }
+
+  /**
+   * The SSE URL of the runtime; the http(s) alternative to `getWsURL`
+   * when `server.transport` is `"sse"`. Unlike WebSockets, SSE requests
+   * can send headers, so auth travels in the Authorization header
+   * (see `headers()`) instead of the URL.
+   */
+  public getSseURL(sessionId: SessionId): URL {
+    const url = this.getSessionURL("/sse", sessionId);
+    // The page URL can still carry access_token (merged in from the
+    // current page's params, before auth cleanup strips it); never
+    // forward it — a token in the URL leaks into proxy/server logs.
+    url.searchParams.delete(KnownQueryParams.accessToken);
+    return url;
+  }
+
+  /**
+   * The host API URL of a notebook, below which its operations are served.
+   * Requests send auth in headers (see `headers()`), never in the URL.
+   */
+  public getNotebookURL(notebookId: NotebookId): URL {
+    const url = this.formatHttpURL({
+      path: `/api/marimo/v1/notebooks/${encodeURIComponent(notebookId)}`,
+    });
+    url.searchParams.delete(KnownQueryParams.accessToken);
+    return url;
+  }
+
+  /**
+   * The WebSocket URL of the terminal.
+   */
+  public getTerminalWsURL(size?: { rows: number; cols: number }): URL {
+    const url = this.formatWsURL("/terminal/ws");
+    if (size) {
+      url.searchParams.set("rows", String(size.rows));
+      url.searchParams.set("cols", String(size.cols));
+    }
+    return url;
+  }
+
+  /**
+   * The URL of the copilot server.
+   */
+  public getLSPURL(
+    lsp: "pylsp" | "basedpyright" | "copilot" | "ty" | "pyrefly",
+  ): URL {
+    if (lsp === "copilot") {
+      // For copilot, strip all query parameters except the auth token.
+      // Copilot doesn't understand arbitrary query params, but we still
+      // need access_token for cross-origin authentication.
+      const url = this.formatWsURL(`/lsp/${lsp}`);
+      const accessToken = url.searchParams.get(KnownQueryParams.accessToken);
+      url.search = "";
+      if (accessToken) {
+        url.searchParams.set(KnownQueryParams.accessToken, accessToken);
+      }
+      return url;
+    }
+    return this.formatWsURL(`/lsp/${lsp}`);
+  }
+
+  public getAiURL(path: "completion" | "chat"): URL {
+    return this.formatHttpURL({ path: `/api/ai/${path}` });
+  }
+
+  /**
+   * The URL of the health check endpoint.
+   */
+  public healthURL(): URL {
+    return this.formatHttpURL({ path: "/health" });
+  }
+
+  private async fetchHealth(): Promise<Response | null> {
+    try {
+      return await fetch(this.healthURL().toString());
+    } catch (error) {
+      Logger.error(
+        `Failed to check health: ${error instanceof Error ? error.message : "Unknown error"}`,
+        { cause: error },
+      );
+      return null;
+    }
+  }
+
+  public async reconcileFromHealth(): Promise<boolean> {
+    // Always healthy if WASM, Islands, or a static notebook (no server)
+    if (this.isServerless) {
+      return true;
+    }
+
+    const response = await this.fetchHealth();
+
+    if (!response) {
+      return false;
+    }
+
+    if (response.redirected) {
+      Logger.debug(`Runtime redirected to ${response.url}`);
+      // strip /health from the URL, using URL parsing to handle query params
+      const redirected = new URL(response.url);
+      redirected.pathname = redirected.pathname.replace(/\/health$/, "");
+      this.config.url = redirected.toString();
+    }
+
+    if (response.ok) {
+      this.setDOMBaseUri(this.config.url);
+    }
+
+    return response.ok;
+  }
+
+  public async probeHealth(): Promise<boolean> {
+    // Always healthy if WASM, Islands, or a static notebook (no server)
+    if (this.isServerless) {
+      return true;
+    }
+
+    const response = await this.fetchHealth();
+    return response?.ok ?? false;
+  }
+
+  /**
+   * Sets the base URI for resolving relative URLs in the document.
+   *
+   * @param uri - The base URI to set. This should be a valid URL string.
+   *
+   * @remarks
+   * This method modifies the `<base>` element in the document's `<head>`.
+   * If a `<base>` element already exists, its `href` attribute is updated.
+   * Otherwise, a new `<base>` element is created and appended to the `<head>`.
+   *
+   * Side effects:
+   * - Changes how relative URLs are resolved in the document.
+   * - May affect the behavior of scripts, styles, and other resources that use relative URLs.
+   */
+  private setDOMBaseUri(uri: string) {
+    // Remove query params from the URI
+    uri = uri.split("?", 1)[0];
+
+    // Make sure there is a trailing slash
+    if (!uri.endsWith("/")) {
+      uri += "/";
+    }
+
+    let base = document.querySelector("base");
+    if (base) {
+      base.setAttribute("href", uri);
+    } else {
+      base = document.createElement("base");
+      base.setAttribute("href", uri);
+      document.head.append(base);
+    }
+  }
+
+  public async init(options?: { disableRetryDelay?: boolean }) {
+    Logger.debug("Initializing runtime...");
+    let retries = 0;
+    // This matches backoff logic elsewhere.
+    const maxRetries = 25;
+    const baseDelay = 100; // 0.1 second
+    const growthFactor = 1.2;
+    const maxDelay = 2000;
+
+    while (!(await this.reconcileFromHealth())) {
+      if (retries >= maxRetries) {
+        Logger.error(`Failed to connect after ${maxRetries} retries`);
+        this.initialHealthyCheck.reject(
+          new Error(`Failed to connect after ${maxRetries} retries`),
+        );
+        return;
+      }
+      if (!options?.disableRetryDelay) {
+        const delay = Math.min(baseDelay * growthFactor ** retries, maxDelay);
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+      retries++;
+    }
+
+    Logger.debug("Runtime is healthy");
+    this.initialHealthyCheck.resolve();
+  }
+
+  /**
+   * Wait for the runtime to be healthy.
+   */
+  public async waitForHealthy(): Promise<void> {
+    return this.initialHealthyCheck.promise;
+  }
+
+  public headers(): KnownHeaders {
+    const headers: KnownHeaders = {
+      "Marimo-Session-Id": getSessionId(),
+      "Marimo-Server-Token": this.config.serverToken ?? "",
+      // Needed for widgets that need absolute URLs when embedding in an iframe
+      // e.g. mpl.interactive()
+      // We don't prefix with `marimo` since those get stripped internally
+      "x-runtime-url": this.httpURL.toString(),
+    };
+
+    if (this.config.authToken) {
+      headers.Authorization = `Bearer ${this.config.authToken}`;
+    }
+
+    return headers;
+  }
+
+  public sessionHeaders(): Pick<KnownHeaders, "Marimo-Session-Id"> {
+    return {
+      "Marimo-Session-Id": getSessionId(),
+    };
+  }
+}
+
+interface KnownHeaders {
+  "Marimo-Session-Id": SessionId;
+  "Marimo-Server-Token": string;
+  "x-runtime-url": string;
+  [key: string]: string;
+}
+
+function asWsUrl(url: string): URL {
+  if (!url.startsWith("http")) {
+    Logger.warn(`URL must start with http: ${url}`);
+    const newUrl = new URL(url);
+    newUrl.protocol = "ws";
+    return newUrl;
+  }
+  // Replace the protocol http with ws
+  return new URL(url.replace(/^http/, "ws"));
+}

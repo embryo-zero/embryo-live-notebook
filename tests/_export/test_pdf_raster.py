@@ -1,0 +1,676 @@
+from __future__ import annotations
+
+import asyncio
+import sys
+from contextlib import contextmanager
+from dataclasses import dataclass
+from types import ModuleType
+from typing import Any
+from unittest.mock import AsyncMock, patch
+
+import pytest
+
+import marimo as mo
+from marimo._ast.app import App, InternalApp
+from marimo._convert.ipynb.from_ir import _convert_output_to_ipynb
+from marimo._export import _pdf_raster
+from marimo._export._nbconvert import _render_webpdf_html
+from marimo._export._nbformat_png_fallbacks import (
+    inject_png_fallbacks_into_notebook,
+)
+from marimo._export.requests import PDFRasterizationRequest
+from marimo._messaging.cell_output import CellChannel, CellOutput
+from marimo._messaging.notification import CellNotification
+from marimo._schemas.export_options import PDFRasterizationOptions
+from marimo._session.state.session_view import SessionView
+from tests.mocks import fake_async_playwright
+
+
+@pytest.mark.parametrize("webpdf", [False, True])
+@pytest.mark.parametrize("mimebundle", [False, True])
+@pytest.mark.parametrize(
+    ("mimetype", "content", "needs_capture"),
+    [
+        (
+            "text/html",
+            "<div>Text <marimo-tex>||(x||)</marimo-tex></div>",
+            False,
+        ),
+        ("text/markdown", "<marimo-tex>||[x||]</marimo-tex>", True),
+        (
+            "text/html",
+            ["<div><marimo-", "tex>||(x||)</marimo-tex></div>"],
+            False,
+        ),
+        (
+            "text/html",
+            "<marimo-tex>||(x||)</marimo-tex><marimo-table></marimo-table>",
+            True,
+        ),
+        ("text/plain", "<marimo-tex>||(x||)</marimo-tex>", True),
+    ],
+)
+def test_math_rasterization_depends_on_backend(
+    webpdf: bool,
+    mimebundle: bool,
+    mimetype: str,
+    content: Any,
+    needs_capture: bool,
+) -> None:
+    view = SessionView()
+    view.cell_notifications["1"] = _cell_notification(
+        cell_id="1",
+        mimetype=(
+            "application/vnd.marimo+mimebundle" if mimebundle else mimetype
+        ),
+        data={mimetype: content} if mimebundle else content,
+    )
+    assert _pdf_raster._collect_raster_targets(view, webpdf=webpdf) == (
+        [_pdf_raster._RasterTarget(cell_id="1", expects=())]
+        if not webpdf or needs_capture
+        else []
+    )
+
+
+@pytest.mark.parametrize("webpdf", [False, True])
+def test_escaped_tex_markup_preserves_existing_raster_classification(
+    webpdf: bool,
+) -> None:
+    # Preserve classification without endorsing unescaping literal markup.
+    assert _pdf_raster._should_rasterize_output(
+        "text/html",
+        "&lt;marimo-tex&gt;||(x||)&lt;/marimo-tex&gt;",
+        webpdf=webpdf,
+    )
+
+
+def _cell_notification(
+    *,
+    cell_id: str,
+    mimetype: str,
+    data: object,
+) -> CellNotification:
+    return CellNotification(
+        cell_id=cell_id,
+        status="idle",
+        output=CellOutput(
+            channel=CellChannel.OUTPUT,
+            mimetype=mimetype,
+            data=data,
+        ),
+        timestamp=0,
+    )
+
+
+@pytest.mark.parametrize("webpdf", [False, True])
+def test_sympy_stack_uses_native_html_only_for_webpdf(webpdf: bool) -> None:
+    sympy = pytest.importorskip("sympy")
+    nbformat = pytest.importorskip("nbformat")
+    pytest.importorskip("nbconvert")
+    from bs4 import BeautifulSoup
+
+    a, b = sympy.symbols("a b")
+    stack = mo.vstack(
+        [mo.md("Markdown text"), mo.Html("<p>HTML text</p>"), sympy.Eq(a, b)]
+    )
+    view = SessionView()
+    notification = _cell_notification(
+        cell_id="1", mimetype="text/html", data=stack.text
+    )
+    view.cell_notifications["1"] = notification
+    png_payload = "ZmFrZQ=="
+    with patch.object(
+        _pdf_raster,
+        "_collect_static_captures",
+        new_callable=AsyncMock,
+        return_value={"1": f"data:image/png;base64,{png_payload}"},
+    ) as capture:
+        fallbacks = asyncio.run(
+            _pdf_raster.collect_pdf_png_fallbacks(
+                PDFRasterizationRequest(
+                    app=InternalApp(App()),
+                    session_view=view,
+                    filename=None,
+                    filepath=None,
+                    options=PDFRasterizationOptions(),
+                    webpdf=webpdf,
+                )
+            )
+        )
+
+    assert notification.output is not None
+    output = _convert_output_to_ipynb(notification.output)
+    notebook = nbformat.v4.new_notebook(
+        cells=[nbformat.v4.new_code_cell("", id="1", outputs=[output])]
+    )
+    inject_png_fallbacks_into_notebook(notebook, fallbacks)
+    if webpdf:
+        capture.assert_not_awaited()
+        html = _render_webpdf_html(notebook, False, None)
+        rendered = BeautifulSoup(html, "html.parser").select_one(
+            ".jp-OutputArea-output"
+        )
+        assert rendered is not None
+        assert {
+            "text": rendered.get_text(" ", strip=True),
+            "images": len(rendered.find_all("img")),
+            "tex_elements": len(rendered.find_all("marimo-tex")),
+        } == {
+            "text": "Markdown text HTML text $$\na = b\n$$",
+            "images": 0,
+            "tex_elements": 0,
+        }
+    else:
+        capture.assert_awaited_once()
+        assert capture.call_args.kwargs["static_targets"] == [
+            _pdf_raster._RasterTarget(cell_id="1", expects=())
+        ]
+        assert notebook.cells[0].outputs[0].data == {"image/png": png_payload}
+
+
+def test_collect_raster_targets_detects_html_vega_and_anywidget() -> None:
+    session_view = SessionView()
+    session_view.cell_notifications["1"] = _cell_notification(
+        cell_id="1",
+        mimetype="text/html",
+        data="<div>hello</div>",
+    )
+    session_view.cell_notifications["2"] = _cell_notification(
+        cell_id="2",
+        mimetype="application/vnd.marimo+mimebundle",
+        data={
+            "application/vnd.vegalite.v5+json": {"mark": "point"},
+            "text/plain": "vega",
+        },
+    )
+    session_view.cell_notifications["3"] = _cell_notification(
+        cell_id="3",
+        mimetype="text/markdown",
+        data=(
+            "&lt;marimo-anywidget "
+            'data-initial-value=\'{"model_id":"model-1"}\''
+            "&gt;&lt;/marimo-anywidget&gt;"
+        ),
+    )
+    session_view.cell_notifications["4"] = _cell_notification(
+        cell_id="4",
+        mimetype="text/plain",
+        data="plain text",
+    )
+    session_view.cell_notifications["5"] = _cell_notification(
+        cell_id="5",
+        mimetype="text/html",
+        data=("<marimo-stack>application/vnd.vegalite.v6+json</marimo-stack>"),
+    )
+
+    targets = _pdf_raster._collect_raster_targets(session_view)
+
+    by_id = {target.cell_id: target for target in targets}
+    assert set(by_id) == {"2", "3", "5"}
+    assert by_id["2"].expects == ("vega",)
+    assert by_id["3"].expects == ("anywidget",)
+    assert by_id["5"].expects == ("vega",)
+
+
+def test_collect_pdf_png_fallbacks_mixed_targets_use_static_by_default() -> (
+    None
+):
+    session_view = SessionView()
+    events: list[Any] = []
+    original_anywidget = (
+        '&lt;marimo-anywidget data-initial-value=\'{"model_id":"m-live"}\''
+        "&gt;&lt;/marimo-anywidget&gt;"
+    )
+    session_view.cell_notifications["1"] = _cell_notification(
+        cell_id="1",
+        mimetype="text/plain",
+        data=original_anywidget,
+    )
+    session_view.cell_notifications["2"] = _cell_notification(
+        cell_id="2",
+        mimetype="text/html",
+        data="<marimo-slider></marimo-slider>",
+    )
+    session_view.cell_notifications["3"] = _cell_notification(
+        cell_id="3",
+        mimetype="application/vnd.marimo+mimebundle",
+        data={
+            "application/vnd.vegalite.v6+json": {"mark": "point"},
+            "text/plain": "vega",
+        },
+    )
+    app = InternalApp(App())
+    app.cell_manager.cell_ids = lambda: ["3", "2", "1"]  # type: ignore[assignment]
+    live_capture_mock = AsyncMock(
+        side_effect=AssertionError(
+            "live capture should not run for default static mode"
+        )
+    )
+
+    class _FakeServer:
+        base_url = "http://127.0.0.1:1234"
+        page_url = "http://127.0.0.1:1234/__marimo_pdf_raster__.html"
+
+        def __enter__(self) -> Any:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def set_html(self, html: str) -> None:
+            assert "<html" in html
+
+    async def _capture_static(
+        *,
+        page_url: str,
+        targets: list[_pdf_raster._RasterTarget],
+        scale: float,
+        status_callback: Any = None,
+    ) -> dict[str, str]:
+        del status_callback
+        assert page_url.endswith("__marimo_pdf_raster__.html")
+        assert scale == 4.0
+        assert [target.cell_id for target in targets] == ["3", "2", "1"]
+        return {
+            "3": "data:image/png;base64,c3RhdGljMw==",
+            "2": "data:image/png;base64,c3RhdGljMg==",
+            "1": "data:image/png;base64,c3RhdGljMQ==",
+        }
+
+    def _fake_export_as_html(*args: Any, **kwargs: Any) -> tuple[str, str]:
+        del args
+        del kwargs
+        return "<html></html>", "demo.html"
+
+    async def _run() -> dict[str, str]:
+        with (
+            patch.object(
+                _pdf_raster,
+                "HtmlAssetServer",
+                return_value=_FakeServer(),
+            ),
+            patch.object(
+                _pdf_raster,
+                "_capture_pngs_from_page",
+                side_effect=_capture_static,
+            ),
+            patch.object(
+                _pdf_raster,
+                "_collect_live_captures",
+                live_capture_mock,
+            ),
+            patch(
+                "marimo._export.exporter.Exporter.export_as_html",
+                side_effect=_fake_export_as_html,
+            ),
+        ):
+            return await _pdf_raster.collect_pdf_png_fallbacks(
+                PDFRasterizationRequest(
+                    app=app,
+                    session_view=session_view,
+                    filename="demo.py",
+                    filepath="demo.py",
+                    options=PDFRasterizationOptions(),
+                    status_callback=events.append,
+                )
+            )
+
+    captures = asyncio.run(_run())
+    assert captures == {
+        "1": "data:image/png;base64,c3RhdGljMQ==",
+        "2": "data:image/png;base64,c3RhdGljMg==",
+        "3": "data:image/png;base64,c3RhdGljMw==",
+    }
+    live_capture_mock.assert_not_awaited()
+    assert [(event.phase, event.message, event.total) for event in events] == [
+        ("raster", "rasterizing interactive outputs...", 3)
+    ]
+    output = session_view.cell_notifications["1"].output
+    assert output is not None
+    assert output.mimetype == "text/plain"
+    assert output.data == original_anywidget
+
+
+def test_collect_pdf_png_fallbacks_static_only_uses_static_capture() -> None:
+    session_view = SessionView()
+    session_view.cell_notifications["1"] = _cell_notification(
+        cell_id="1",
+        mimetype="application/vnd.marimo+mimebundle",
+        data={
+            "application/vnd.vegalite.v6+json": {"mark": "point"},
+            "text/plain": "vega",
+        },
+    )
+    app = InternalApp(App())
+    app.cell_manager.cell_ids = lambda: ["1"]  # type: ignore[assignment]
+
+    class _FakeServer:
+        base_url = "http://127.0.0.1:1234"
+        page_url = "http://127.0.0.1:1234/__marimo_pdf_raster__.html"
+
+        def __enter__(self) -> Any:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def set_html(self, html: str) -> None:
+            assert "<html" in html
+
+    async def _capture_static(
+        *,
+        page_url: str,
+        targets: list[_pdf_raster._RasterTarget],
+        scale: float,
+        status_callback: Any = None,
+    ) -> dict[str, str]:
+        del status_callback
+        assert page_url.endswith("__marimo_pdf_raster__.html")
+        assert scale == 4.0
+        assert [target.cell_id for target in targets] == ["1"]
+        return {"1": "data:image/png;base64,c3RhdGlj"}
+
+    live_capture_mock = AsyncMock(
+        side_effect=AssertionError(
+            "live capture should not run for static-only targets"
+        )
+    )
+
+    def _fake_export_as_html(*args: Any, **kwargs: Any) -> tuple[str, str]:
+        del args
+        del kwargs
+        return "<html></html>", "demo.html"
+
+    async def _run() -> dict[str, str]:
+        with (
+            patch.object(
+                _pdf_raster,
+                "HtmlAssetServer",
+                return_value=_FakeServer(),
+            ),
+            patch.object(
+                _pdf_raster,
+                "_capture_pngs_from_page",
+                side_effect=_capture_static,
+            ),
+            patch.object(
+                _pdf_raster,
+                "_collect_live_captures",
+                live_capture_mock,
+            ),
+            patch(
+                "marimo._export.exporter.Exporter.export_as_html",
+                side_effect=_fake_export_as_html,
+            ),
+        ):
+            return await _pdf_raster.collect_pdf_png_fallbacks(
+                PDFRasterizationRequest(
+                    app=app,
+                    session_view=session_view,
+                    filename="demo.py",
+                    filepath="demo.py",
+                    options=PDFRasterizationOptions(),
+                )
+            )
+
+    captures = asyncio.run(_run())
+    assert captures == {"1": "data:image/png;base64,c3RhdGlj"}
+    live_capture_mock.assert_not_awaited()
+
+
+def test_collect_pdf_png_fallbacks_live_mode_uses_live_capture() -> None:
+    session_view = SessionView()
+    session_view.cell_notifications["1"] = _cell_notification(
+        cell_id="1",
+        mimetype="application/vnd.marimo+mimebundle",
+        data={
+            "application/vnd.vegalite.v6+json": {"mark": "point"},
+            "text/plain": "vega",
+        },
+    )
+    session_view.cell_notifications["2"] = _cell_notification(
+        cell_id="2",
+        mimetype="text/html",
+        data="<marimo-slider></marimo-slider>",
+    )
+    app = InternalApp(App())
+    app.cell_manager.cell_ids = lambda: ["2", "1"]  # type: ignore[assignment]
+
+    static_capture_mock = AsyncMock(
+        side_effect=AssertionError(
+            "static capture should not run for explicit live mode"
+        )
+    )
+
+    async def _capture_live(
+        *,
+        page_url: str,
+        targets: list[_pdf_raster._RasterTarget],
+        scale: float,
+        status_callback: Any = None,
+    ) -> dict[str, str]:
+        assert page_url == "http://127.0.0.1:1234/demo"
+        del scale
+        del status_callback
+        assert [target.cell_id for target in targets] == ["2", "1"]
+        return {
+            "2": "data:image/png;base64,bGl2ZTI=",
+            "1": "data:image/png;base64,bGl2ZTE=",
+        }
+
+    @contextmanager
+    def _live_page_url() -> Any:
+        yield "http://127.0.0.1:1234/demo"
+
+    async def _run() -> dict[str, str]:
+        with (
+            patch.object(
+                _pdf_raster,
+                "_collect_static_captures",
+                static_capture_mock,
+            ),
+            patch.object(
+                _pdf_raster,
+                "_capture_pngs_from_page",
+                side_effect=_capture_live,
+            ),
+        ):
+            return await _pdf_raster.collect_pdf_png_fallbacks(
+                PDFRasterizationRequest(
+                    app=app,
+                    session_view=session_view,
+                    filename="demo.py",
+                    filepath="demo.py",
+                    options=PDFRasterizationOptions(server_mode="live"),
+                    live_page_url=_live_page_url,
+                )
+            )
+
+    captures = asyncio.run(_run())
+    assert captures == {
+        "1": "data:image/png;base64,bGl2ZTE=",
+        "2": "data:image/png;base64,bGl2ZTI=",
+    }
+    static_capture_mock.assert_not_awaited()
+
+
+def test_collect_pdf_png_fallbacks_does_not_open_live_page_without_targets() -> (
+    None
+):
+    opened = False
+
+    @contextmanager
+    def _live_page_url() -> Any:
+        nonlocal opened
+        opened = True
+        yield "http://127.0.0.1:1234/demo"
+
+    captures = asyncio.run(
+        _pdf_raster.collect_pdf_png_fallbacks(
+            PDFRasterizationRequest(
+                app=InternalApp(App()),
+                session_view=SessionView(),
+                filename="demo.py",
+                filepath="demo.py",
+                options=PDFRasterizationOptions(server_mode="live"),
+                live_page_url=_live_page_url,
+            )
+        )
+    )
+
+    assert captures == {}
+    assert opened is False
+
+
+def test_wait_for_target_ready_uses_settle_wait_for_dynamic_targets() -> None:
+    class _TimeoutError(Exception):
+        pass
+
+    page = AsyncMock()
+    locator = AsyncMock()
+    target = _pdf_raster._RasterTarget(
+        cell_id="dynamic-cell",
+        expects=("vega",),
+    )
+
+    settle_wait = AsyncMock()
+    with patch.object(
+        _pdf_raster,
+        "_wait_for_navigation_settled",
+        settle_wait,
+    ):
+        ready = asyncio.run(
+            _pdf_raster._wait_for_target_ready(
+                page=page,
+                target=target,
+                locator=locator,
+                timeout_error=_TimeoutError,
+            )
+        )
+
+    assert ready is True
+    settle_wait.assert_awaited_once()
+
+
+def test_capture_pngs_from_page_reports_progress_in_notebook_order() -> None:
+    class _TimeoutError(Exception):
+        pass
+
+    events: list[Any] = []
+    visited_locators: list[str] = []
+
+    class _FakeLocator:
+        def __init__(self, selector: str) -> None:
+            self.selector = selector
+            self.first = self
+
+        async def wait_for(self, *args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+
+        async def scroll_into_view_if_needed(
+            self, *args: Any, **kwargs: Any
+        ) -> None:
+            del args, kwargs
+
+        async def screenshot(self, *args: Any, **kwargs: Any) -> bytes:
+            del args, kwargs
+            return self.selector.encode("utf-8")
+
+    class _FakePage:
+        async def goto(self, *args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+
+        async def wait_for_load_state(self, *args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+
+        async def wait_for_function(self, *args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+
+        async def evaluate(self, *args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+
+        def locator(self, selector: str) -> _FakeLocator:
+            visited_locators.append(selector)
+            return _FakeLocator(selector)
+
+    class _FakeContext:
+        def __init__(self, page: _FakePage) -> None:
+            self._page = page
+
+        async def new_page(self) -> _FakePage:
+            return self._page
+
+        async def close(self) -> None:
+            return None
+
+    class _FakeBrowser:
+        def __init__(self, context: _FakeContext) -> None:
+            self._context = context
+
+        async def new_context(self, *args: Any, **kwargs: Any) -> _FakeContext:
+            del args, kwargs
+            return self._context
+
+        async def close(self) -> None:
+            return None
+
+    class _FakeChromium:
+        def __init__(self, browser: _FakeBrowser) -> None:
+            self._browser = browser
+
+        async def launch(self) -> _FakeBrowser:
+            return self._browser
+
+    @dataclass
+    class _FakePlaywright:
+        chromium: _FakeChromium
+
+    page = _FakePage()
+    context = _FakeContext(page)
+    browser = _FakeBrowser(context)
+    playwright = _FakePlaywright(_FakeChromium(browser))
+
+    fake_async_api = ModuleType("playwright.async_api")
+    fake_async_api.TimeoutError = _TimeoutError
+    fake_async_api.async_playwright = fake_async_playwright(playwright)
+    fake_playwright = ModuleType("playwright")
+    fake_playwright.async_api = fake_async_api  # type: ignore[attr-defined]
+
+    targets = [
+        _pdf_raster._RasterTarget(cell_id="2", expects=("vega",)),
+        _pdf_raster._RasterTarget(cell_id="1", expects=("anywidget",)),
+    ]
+
+    with (
+        patch.dict(
+            sys.modules,
+            {
+                "playwright": fake_playwright,
+                "playwright.async_api": fake_async_api,
+            },
+        ),
+        patch.object(
+            _pdf_raster,
+            "_wait_for_target_ready",
+            AsyncMock(return_value=True),
+        ),
+        asyncio.Runner(loop_factory=asyncio.SelectorEventLoop) as runner,
+    ):
+        captures = runner.run(
+            _pdf_raster._capture_pngs_from_page(
+                page_url="http://127.0.0.1:1234/demo.html",
+                targets=targets,
+                scale=2.0,
+                status_callback=events.append,
+            )
+        )
+
+    assert list(captures) == ["2", "1"]
+    assert [(event.current, event.total) for event in events] == [
+        (1, 2),
+        (2, 2),
+    ]
+    assert visited_locators == [
+        "#output-2 > .output, #output-2 > .vega-embed",
+        "#output-1 > .output, #output-1 > .vega-embed",
+    ]

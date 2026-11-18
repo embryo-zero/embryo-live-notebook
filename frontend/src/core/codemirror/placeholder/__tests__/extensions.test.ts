@@ -1,0 +1,207 @@
+/* Copyright 2026 Marimo. All rights reserved. */
+
+import { EditorState } from "@codemirror/state";
+import { EditorView } from "@codemirror/view";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  clickablePlaceholderExtension,
+  smartPlaceholderExtension,
+} from "../extensions";
+
+describe("smartPlaceholderExtension", () => {
+  const placeholderText = "Type something...";
+  let view: EditorView;
+
+  beforeEach(() => {
+    view = new EditorView({
+      state: EditorState.create({
+        doc: "",
+        extensions: smartPlaceholderExtension(placeholderText),
+      }),
+    });
+  });
+
+  afterEach(() => {
+    view.destroy();
+  });
+
+  it("should insert placeholder on ArrowRight when empty", () => {
+    // Simulate ArrowRight key
+    const event = new KeyboardEvent("keydown", { key: "ArrowRight" });
+    view.contentDOM.dispatchEvent(event);
+
+    expect(view.state.doc.toString()).toBe(placeholderText);
+    expect(view.state.selection.main.head).toBe(placeholderText.length);
+  });
+
+  it("should insert placeholder on Tab when empty", () => {
+    // Simulate Tab key
+    const event = new KeyboardEvent("keydown", { key: "Tab" });
+    view.contentDOM.dispatchEvent(event);
+
+    expect(view.state.doc.toString()).toBe(placeholderText);
+    expect(view.state.selection.main.head).toBe(placeholderText.length);
+  });
+
+  it("should not insert placeholder when not empty", () => {
+    // Add some content
+    view.dispatch({
+      changes: { from: 0, insert: "existing content" },
+    });
+
+    // Simulate ArrowRight key
+    const event = new KeyboardEvent("keydown", { key: "ArrowRight" });
+    view.contentDOM.dispatchEvent(event);
+
+    expect(view.state.doc.toString()).toBe("existing content");
+  });
+});
+
+describe("clickablePlaceholderExtension", () => {
+  it("should create placeholder with clickable link", () => {
+    const onClick = vi.fn();
+    const opts = {
+      beforeText: "Click ",
+      linkText: "here",
+      afterText: " to continue",
+      onClick,
+    };
+
+    const extension = clickablePlaceholderExtension(opts);
+    const view = new EditorView({
+      state: EditorState.create({
+        doc: "",
+        extensions: extension,
+      }),
+    });
+
+    // Get the placeholder element
+    const placeholder = view.dom.querySelector(".cm-placeholder")!;
+    expect(placeholder).toBeTruthy();
+
+    // Check text content
+    expect(placeholder.textContent).toBe("Click here to continue");
+    expect(
+      [...placeholder.querySelectorAll('[aria-hidden="true"]')].map(
+        (node) => node.textContent,
+      ),
+    ).toEqual(["Click ", " to continue"]);
+    expect(
+      placeholder.querySelector("button")?.closest('[aria-hidden="true"]'),
+    ).toBeNull();
+
+    // Find and check the clickable link
+    const link = placeholder.querySelector(".cm-clickable-placeholder")!;
+    expect(link).toBeTruthy();
+    expect(link.textContent).toBe("here");
+    expect(link.tagName).toBe("BUTTON");
+    expect(link.closest('[aria-hidden="true"]')).toBeNull();
+    expect(link.getAttribute("type")).toBe("button");
+
+    // Simulate click
+    (link as HTMLElement).click();
+    expect(onClick).toHaveBeenCalled();
+
+    view.dispatch({ changes: { from: 0, insert: "Hello" } });
+    expect(view.dom.querySelector(".cm-clickable-placeholder")).toBeNull();
+    view.dispatch({ changes: { from: 0, to: 5 } });
+    expect(view.dom.querySelector("button")?.textContent).toBe("here");
+
+    // Check theme classes
+    expect(link.classList.contains("cm-clickable-placeholder")).toBe(true);
+
+    view.destroy();
+  });
+
+  it("should stop event propagation on link click", () => {
+    const onClick = vi.fn();
+    const opts = {
+      beforeText: "Click ",
+      linkText: "here",
+      afterText: " to continue",
+      onClick,
+    };
+
+    const extension = clickablePlaceholderExtension(opts);
+    const view = new EditorView({
+      state: EditorState.create({
+        doc: "",
+        extensions: extension,
+      }),
+    });
+
+    // Get the link element
+    const link = view.dom.querySelector(".cm-clickable-placeholder")!;
+
+    // Create a mock event
+    const event = new MouseEvent("click");
+    const stopPropagation = vi.spyOn(event, "stopPropagation");
+
+    // Simulate click with the mock event
+    link.dispatchEvent(event);
+
+    expect(stopPropagation).toHaveBeenCalled();
+    expect(onClick).toHaveBeenCalled();
+
+    view.destroy();
+  });
+
+  describe("caret coordinates", () => {
+    const original = Range.prototype.getClientRects;
+    let rects: Array<Pick<DOMRect, "left" | "right" | "top" | "bottom">>;
+
+    beforeEach(() => {
+      rects = [{ left: 10, right: 50, top: 2, bottom: 18 }];
+      Range.prototype.getClientRects = () => rects as unknown as DOMRectList;
+    });
+
+    afterEach(() => {
+      Range.prototype.getClientRects = original;
+    });
+
+    function renderWidget(beforeText: string) {
+      const view = new EditorView({
+        state: EditorState.create({
+          doc: "",
+          extensions: clickablePlaceholderExtension({
+            beforeText,
+            linkText: "here",
+            afterText: "",
+            onClick: vi.fn(),
+          }),
+        }),
+      });
+      const widget = view.state
+        .facet(EditorView.decorations)
+        .flatMap((deco) => (typeof deco === "function" ? [deco(view)] : [deco]))
+        .map((set) => set.iter().value?.spec.widget)
+        .find(Boolean);
+      const dom = widget.toDOM(view);
+      document.body.append(dom);
+      return { view, widget, dom };
+    }
+
+    it("collapses the caret to the start of the first line of text", () => {
+      const { view, widget, dom } = renderWidget("Type or ");
+      expect(widget.coordsAt(dom, 0, 1)).toEqual({
+        left: 10,
+        right: 10,
+        top: 2,
+        bottom: 18,
+      });
+      dom.style.direction = "rtl";
+      expect(widget.coordsAt(dom, 0, 1)).toMatchObject({ left: 50, right: 50 });
+      dom.remove();
+      view.destroy();
+    });
+
+    it("skips empty text and falls back when nothing is laid out", () => {
+      const { view, widget, dom } = renderWidget("");
+      expect(widget.coordsAt(dom, 0, 1)).toMatchObject({ left: 10 });
+      rects = [];
+      expect(widget.coordsAt(dom, 0, 1)).toBeNull();
+      dom.remove();
+      view.destroy();
+    });
+  });
+});

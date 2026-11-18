@@ -1,0 +1,75 @@
+/* Copyright 2026 Marimo. All rights reserved. */
+
+import type { TypedNumber } from "./typed";
+
+export type Milliseconds = TypedNumber<"milliseconds">;
+
+export type Seconds = TypedNumber<"seconds">;
+
+export class Time {
+  private readonly ms: Milliseconds;
+
+  public static fromMilliseconds(ms: Milliseconds): Time;
+  public static fromMilliseconds(ms: Milliseconds | null): Time | null;
+  public static fromMilliseconds(ms: Milliseconds | null): Time | null {
+    if (ms == null) {
+      return null;
+    }
+    return new Time(ms);
+  }
+
+  public static fromSeconds(s: Seconds): Time;
+  public static fromSeconds(s: Seconds | null): Time | null;
+  public static fromSeconds(s: Seconds | null): Time | null {
+    if (s == null) {
+      return null;
+    }
+    return new Time((s * 1000) as Milliseconds);
+  }
+
+  public static now(): Time {
+    return new Time(Date.now() as Milliseconds);
+  }
+
+  /** The instant an ISO 8601 timestamp names. */
+  public static parse(iso: string): Time {
+    return new Time(Date.parse(iso) as Milliseconds);
+  }
+
+  private constructor(ms: Milliseconds) {
+    this.ms = ms;
+  }
+
+  public toMilliseconds(): Milliseconds {
+    return this.ms;
+  }
+
+  /** How long after `start` this instant is. */
+  public since(start: Time): Milliseconds {
+    return (this.ms - start.ms) as Milliseconds;
+  }
+
+  public toSeconds(): Seconds {
+    return (this.ms / 1000) as Seconds;
+  }
+}
+
+/** Format a duration in milliseconds, e.g. `500ms`, `1.50s`, `1m30s`. */
+export function formatElapsedTime(elapsedTime: number | null): string {
+  if (elapsedTime === null) {
+    return "";
+  }
+
+  const milliseconds = elapsedTime;
+  const seconds = milliseconds / 1000;
+
+  if (seconds >= 60) {
+    const minutes = Math.floor(seconds / 60);
+    const remainingSeconds = Math.floor(seconds % 60);
+    return `${minutes}m${remainingSeconds}s`;
+  }
+  if (seconds >= 1) {
+    return `${seconds.toFixed(2).toString()}s`;
+  }
+  return `${milliseconds.toFixed(0).toString()}ms`;
+}

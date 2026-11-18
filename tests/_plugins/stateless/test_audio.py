@@ -1,0 +1,342 @@
+# Copyright 2026 Marimo. All rights reserved.
+from __future__ import annotations
+
+import base64
+import io
+import sys
+import wave
+from html.parser import HTMLParser
+from pathlib import Path
+
+import pytest
+
+from marimo._dependencies.dependencies import DependencyManager
+from marimo._plugins.stateless.audio import audio
+from marimo._runtime.context import get_context
+from marimo._runtime.runtime import Kernel
+from tests.conftest import ExecReqProvider
+
+HAS_NUMPY = DependencyManager.numpy.has()
+
+
+async def test_audio_url() -> None:
+    result = audio("https://example.com/test.wav")
+    assert (
+        result.text
+        == "<audio src='https://example.com/test.wav' controls></audio>"
+    )
+
+
+async def test_audio_pathlib_nonexistent_passthrough() -> None:
+    src = Path("public/__marimo_test_does_not_exist__.wav")
+    result = audio(src)
+    assert f"src='{src.as_posix()}'" in result.text
+    assert "data:" not in result.text
+
+
+async def test_audio_filename(k: Kernel, exec_req: ExecReqProvider) -> None:
+    await k.run(
+        [
+            exec_req.get(
+                """
+                import marimo as mo
+                import os
+                with open("test_audio.wav", "wb") as f:
+                    f.write(b"hello")
+                audio = mo.audio("test_audio.wav")
+                # Delete the file
+                os.remove("test_audio.wav")
+                """
+            ),
+        ]
+    )
+    assert len(get_context().virtual_file_registry.registry) == 1
+    for fname in get_context().virtual_file_registry.registry:
+        assert fname.endswith(".wav")
+
+
+async def test_audio_pathlib_path(
+    k: Kernel, exec_req: ExecReqProvider
+) -> None:
+    await k.run(
+        [
+            exec_req.get(
+                """
+                from pathlib import Path
+                import marimo as mo
+                import os
+                with open("test_audio.wav", "wb") as f:
+                    f.write(b"hello")
+                audio = mo.audio(Path("test_audio.wav"))
+                os.remove("test_audio.wav")
+                """
+            ),
+        ]
+    )
+    assert len(get_context().virtual_file_registry.registry) == 1
+    for fname in get_context().virtual_file_registry.registry:
+        assert fname.endswith(".wav")
+
+
+@pytest.mark.parametrize(
+    ("filename", "expected_ext"),
+    [
+        ("test_audio.mp3", ".mp3"),
+        ("test_audio_no_ext", ".wav"),
+    ],
+)
+async def test_audio_pathlib_variations(
+    k: Kernel,
+    exec_req: ExecReqProvider,
+    filename: str,
+    expected_ext: str,
+) -> None:
+    await k.run(
+        [
+            exec_req.get(
+                f"""
+                from pathlib import Path
+                import marimo as mo
+                import os
+                with open("{filename}", "wb") as f:
+                    f.write(b"hello")
+                audio = mo.audio(Path("{filename}"))
+                os.remove("{filename}")
+                """
+            ),
+        ]
+    )
+    assert len(get_context().virtual_file_registry.registry) == 1
+    for fname in get_context().virtual_file_registry.registry:
+        assert fname.endswith(expected_ext)
+
+
+async def test_audio_pathlib_home_expansion(
+    k: Kernel,
+    exec_req: ExecReqProvider,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    fake_home = tmp_path / "fake_home"
+    fake_home.mkdir()
+    sample = fake_home / "sample.wav"
+    sample.write_bytes(b"hello")
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("USERPROFILE", str(fake_home))
+    await k.run(
+        [
+            exec_req.get(
+                """
+                from pathlib import Path
+                import marimo as mo
+                audio = mo.audio(Path("~/sample.wav"))
+                """
+            ),
+        ]
+    )
+    assert len(get_context().virtual_file_registry.registry) == 1
+    for fname in get_context().virtual_file_registry.registry:
+        assert fname.endswith(".wav")
+
+
+async def test_audio_pathlib_real_media(
+    k: Kernel, exec_req: ExecReqProvider, tmp_path: Path
+) -> None:
+    real_wav = tmp_path / "real_audio.wav"
+    with wave.open(str(real_wav), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(44100)
+        w.writeframes(b"\x00\x00" * 100)
+
+    await k.run(
+        [
+            exec_req.get(
+                f"""
+                from pathlib import Path
+                import marimo as mo
+                audio = mo.audio(Path(r"{real_wav.as_posix()}"))
+                """
+            ),
+        ]
+    )
+    assert len(get_context().virtual_file_registry.registry) == 1
+    for fname in get_context().virtual_file_registry.registry:
+        assert fname.endswith(".wav")
+    audio_html = k.globals["audio"]
+    assert "data:" not in audio_html.text
+    assert "@file/" in audio_html.text
+
+
+async def test_audio_bytes_io(k: Kernel, exec_req: ExecReqProvider) -> None:
+    await k.run(
+        [
+            exec_req.get(
+                """
+                import io
+                import marimo as mo
+                bytestream = io.BytesIO(b"hello")
+                audio = mo.audio(bytestream)
+                """
+            ),
+        ]
+    )
+    assert len(get_context().virtual_file_registry.registry) == 1
+    for fname in get_context().virtual_file_registry.registry:
+        assert fname.endswith(".wav")
+
+
+async def test_audio_bytes(k: Kernel, exec_req: ExecReqProvider) -> None:
+    await k.run(
+        [
+            exec_req.get(
+                """
+                import marimo as mo
+                audio = mo.audio(b"hello")
+                """
+            ),
+        ]
+    )
+    assert len(get_context().virtual_file_registry.registry) == 1
+    for fname in get_context().virtual_file_registry.registry:
+        assert fname.endswith(".wav")
+
+
+@pytest.mark.skipif(not HAS_NUMPY, reason="numpy not installed")
+async def test_audio_numpy_mono(k: Kernel, exec_req: ExecReqProvider) -> None:
+    await k.run(
+        [
+            exec_req.get(
+                """
+                import marimo as mo
+                import numpy as np
+                data = np.random.rand(1000) * 2 - 1  # Random values between -1 and 1
+                audio = mo.audio(data, rate=44100)
+                """
+            ),
+        ]
+    )
+    assert len(get_context().virtual_file_registry.registry) == 1
+    for fname in get_context().virtual_file_registry.registry:
+        assert fname.endswith(".wav")
+
+
+@pytest.mark.skipif(not HAS_NUMPY, reason="numpy not installed")
+async def test_audio_numpy_normalize(
+    k: Kernel, exec_req: ExecReqProvider
+) -> None:
+    await k.run(
+        [
+            exec_req.get(
+                """
+                import marimo as mo
+                import numpy as np
+                data = np.random.rand(1000) * 10  # Values > 1
+                audio = mo.audio(data, rate=44100, normalize=True)
+                """
+            ),
+        ]
+    )
+    assert len(get_context().virtual_file_registry.registry) == 1
+    for fname in get_context().virtual_file_registry.registry:
+        assert fname.endswith(".wav")
+
+
+@pytest.mark.skipif(not HAS_NUMPY, reason="numpy not installed")
+async def test_audio_numpy_constructor() -> None:
+    import numpy as np
+
+    # Rate
+    data = np.random.rand(1000) * 2 - 1  # Random values between -1 and 1
+    res = audio(data, rate=44100, normalize=False)
+    assert res.text.startswith("<audio src='data:audio/")
+
+    # Don't normalize out of range
+    data = np.random.rand(1000) * 10  # Values > 1
+    with pytest.raises(ValueError):
+        res = audio(data, rate=44100, normalize=False)
+
+    # Normalize in range
+    data = np.random.rand(1000) * 10  # Values > 1
+    res = audio(data, rate=44100, normalize=True)
+
+    # No rate
+    with pytest.raises(ValueError):
+        res = audio(data)
+
+
+@pytest.mark.skipif(not HAS_NUMPY, reason="numpy not installed")
+@pytest.mark.parametrize("channels", [1, 2])
+@pytest.mark.parametrize("normalize", [True, False])
+def test_audio_numpy_silence(channels: int, normalize: bool) -> None:
+    import numpy as np
+
+    class AudioParser(HTMLParser):
+        src: str | None = None
+
+        def handle_starttag(
+            self, tag: str, attrs: list[tuple[str, str | None]]
+        ) -> None:
+            if tag == "audio":
+                self.src = dict(attrs).get("src")
+
+    samples = 8
+    shape = (samples,) if channels == 1 else (channels, samples)
+    with np.errstate(invalid="raise", divide="raise"):
+        result = audio(np.zeros(shape), rate=44100, normalize=normalize)
+
+    parser = AudioParser()
+    parser.feed(result.text)
+    assert parser.src is not None
+    header, delimiter, encoded = parser.src.partition(",")
+    assert header.startswith("data:audio/")
+    assert header.endswith(";base64")
+    assert delimiter == ","
+    with wave.open(
+        io.BytesIO(base64.b64decode(encoded, validate=True)), "rb"
+    ) as wav:
+        assert tuple(wav.getparams()) == (
+            channels,
+            2,
+            44100,
+            samples,
+            "NONE",
+            "not compressed",
+        )
+        assert wav.readframes(samples) == b"\x00\x00" * channels * samples
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Failing on Windows CI")
+async def test_audio_local_file(k: Kernel, exec_req: ExecReqProvider) -> None:
+    with open(__file__, encoding="utf-8") as f:  # noqa: ASYNC230
+        await k.run(
+            [
+                exec_req.get(
+                    f"""
+                    import marimo as mo
+                    audio = mo.audio('{f.name}')
+                    """
+                ),
+            ]
+        )
+        assert len(get_context().virtual_file_registry.registry) == 1
+
+
+async def test_audio_width() -> None:
+    result = audio("https://example.com/test.wav", width=300)
+    assert (
+        result.text
+        == "<audio src='https://example.com/test.wav' controls style='width: 300px'></audio>"
+    )
+
+
+async def test_audio_style() -> None:
+    result = audio(
+        "https://example.com/test.wav",
+        width="100%",
+        style={"margin-top": "10px"},
+    )
+    assert (
+        result.text
+        == "<audio src='https://example.com/test.wav' controls style='width: 100%;margin-top: 10px'></audio>"
+    )

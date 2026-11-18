@@ -1,0 +1,665 @@
+/**
+ * Pyodide Acceptance Test
+ *
+ * This script tests the built marimo wheel in Pyodide to verify basic functionality works.
+ *
+ * Usage:
+ *   node --experimental-wasm-jspi tests/_pyodide/test_pyodide_acceptance.mjs ./dist/marimo-*.whl
+ *
+ * Exit codes:
+ *   0 - Success: session created, bridge verified
+ *   1 - Failure: any error during the process
+ */
+
+import http from "node:http";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+
+/**
+ * Start a CORS-enabled HTTP server to serve the wheel file plus any extra
+ * files registered at runtime via `addFile(name, buffer, contentType)`.
+ */
+function startWheelServer(wheelPath) {
+  const wheelDir = path.dirname(wheelPath);
+  const wheelFilename = path.basename(wheelPath);
+  const extraFiles = new Map(); // name -> { data: Buffer, contentType: string }
+
+  return new Promise((resolve, reject) => {
+    const server = http.createServer((req, res) => {
+      // Add CORS headers
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+      if (req.method === "OPTIONS") {
+        res.writeHead(200);
+        res.end();
+        return;
+      }
+
+      const requestedFile = req.url?.slice(1); // Remove leading /
+      if (requestedFile === wheelFilename) {
+        const filePath = path.join(wheelDir, wheelFilename);
+        fs.readFile(filePath, (err, data) => {
+          if (err) {
+            res.writeHead(404);
+            res.end("File not found");
+            return;
+          }
+          res.setHeader("Content-Type", "application/zip");
+          res.writeHead(200);
+          res.end(data);
+        });
+        return;
+      }
+
+      const extra = extraFiles.get(requestedFile);
+      if (extra) {
+        res.setHeader("Content-Type", extra.contentType);
+        res.writeHead(200);
+        res.end(extra.data);
+        return;
+      }
+
+      res.writeHead(404);
+      res.end("Not found");
+    });
+
+    // Listen on a random available port
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      const port = typeof address === 'object' && address !== null && 'port' in address ? address.port : 0;
+      console.log(`Wheel server started at http://127.0.0.1:${port}`);
+      resolve({
+        server,
+        port,
+        wheelFilename,
+        addFile: (name, data, contentType = "application/octet-stream") => {
+          extraFiles.set(name, { data, contentType });
+        },
+      });
+    });
+
+    server.on("error", reject);
+  });
+}
+
+async function loadPyodideModule() {
+  try {
+    return await import("pyodide");
+  } catch (error) {
+    for (const candidate of [
+      path.resolve(process.cwd(), "node_modules/pyodide/pyodide.mjs"),
+      path.resolve(process.cwd(), "frontend/node_modules/pyodide/pyodide.mjs"),
+    ]) {
+      if (fs.existsSync(candidate)) {
+        return await import(pathToFileURL(candidate).href);
+      }
+    }
+    throw error;
+  }
+}
+
+async function waitForFrame(frames, predicate) {
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    const frame = frames.find(predicate);
+    if (frame) {
+      return frame;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for a host event: ${JSON.stringify(frames)}`);
+}
+
+async function testHostInputs(notebook, notebookId, frames) {
+  const call = async (operation, key, body, params = {}) =>
+    JSON.parse(await notebook.call(JSON.stringify({
+      operation,
+      params: { notebook_id: notebookId, ...params },
+      headers: { "idempotency-key": key },
+      body,
+    })));
+
+  const answer = async (prompt, value, password = false) => {
+    const { data: { input } } = await waitForFrame(frames, (frame) =>
+      frame.event === "input" && frame.data.input.prompt === prompt &&
+      frame.data.input.status === "pending",
+    );
+    assert.equal(input.password, password);
+    const reply = () => call(
+      "runtime.input", `answer-${input.id}`, { value }, { input_id: input.id },
+    );
+    const answered = await reply();
+    assert.deepEqual(answered, {
+      status: 200,
+      body: { ...input, status: "answered" },
+    });
+    assert.deepEqual(await reply(), answered);
+  };
+
+  const assertSucceeded = async (runId) => {
+    const completed = await waitForFrame(frames, (frame) =>
+      frame.event === "run" && frame.data.run.id === runId &&
+      frame.data.run.status === "completed",
+    );
+    assert.equal(completed.data.run.outcome, "succeeded");
+  };
+
+  const run = await call("runtime.execute", "wasm-input-run", { code: [
+    "import getpass",
+    "_secret = getpass.getpass('Password: ')",
+    "_blank = input('Empty: ')",
+    "assert _secret == 'secret' and _blank == ''",
+  ].join("\n") });
+  assert.equal(run.status, 202);
+  await answer("Password: ", "secret", true);
+  await answer("Empty: ", "");
+  await assertSucceeded(run.body.id);
+  assert.doesNotMatch(
+    JSON.stringify(frames.filter((frame) => frame.event === "input")),
+    /secret/,
+  );
+
+  const concurrent = await call("runtime.execute", "wasm-concurrent-input-run", { code: [
+    "import marimo as mo",
+    "_answers = {}",
+    "def _ask(_label):",
+    "    print(_label + ' reader started')",
+    "    _answers[_label] = input(_label)",
+    "_threads = [mo.Thread(target=_ask, args=(_label,)) for _label in ('first', 'second')]",
+    "for _thread in _threads:",
+    "    _thread.start()",
+    "for _thread in _threads:",
+    "    _thread.join()",
+    "assert _answers == {'first': 'one', 'second': 'two'}",
+  ].join("\n") });
+  assert.equal(concurrent.status, 202);
+  const values = { first: "one", second: "two" };
+  for (const prompt of Object.keys(values)) {
+    await waitForFrame(frames, (frame) =>
+      frame.event === "console" && frame.data.console.text.includes(`${prompt} reader started`),
+    );
+  }
+  const isConcurrentInput = (frame) => frame.event === "input" &&
+    frame.data.request_id === "wasm-concurrent-input-run";
+  const first = await waitForFrame(frames, isConcurrentInput);
+  assert.equal(frames.filter(isConcurrentInput).length, 1);
+  const firstPrompt = first.data.input.prompt;
+  assert.ok(Object.hasOwn(values, firstPrompt));
+  await answer(firstPrompt, values[firstPrompt]);
+  for (const [prompt, value] of Object.entries(values)) {
+    if (prompt !== firstPrompt) {
+      await answer(prompt, value);
+    }
+  }
+  await assertSucceeded(concurrent.body.id);
+}
+
+async function testIdleInterrupt(pyodide, notebook, notebookId, frames) {
+  const buffer = new Uint8Array(new SharedArrayBuffer(1));
+  pyodide.setInterruptBuffer(buffer);
+  const call = (operation, key, body) => notebook.call(JSON.stringify({
+    operation,
+    params: { notebook_id: notebookId },
+    headers: { "idempotency-key": key },
+    body,
+  }));
+  try {
+    buffer[0] = 2;
+    const receipt = JSON.parse(await call("runtime.interrupt", "idle-interrupt"));
+    assert.equal(receipt.status, 202);
+    assert.equal(buffer[0], 0, "The acknowledgement must not leave a pending signal");
+    const run = JSON.parse(await call("runtime.execute", "after-idle-interrupt", { code: "42" }));
+    assert.equal(run.status, 202);
+    const completed = await waitForFrame(frames, (frame) =>
+      frame.event === "run" && frame.data.run.id === run.body.id &&
+      frame.data.run.status === "completed",
+    );
+    assert.equal(completed.data.run.outcome, "succeeded");
+  } finally {
+    pyodide.setInterruptBuffer(undefined);
+  }
+}
+
+/**
+ * Main test function
+ */
+async function main() {
+  // Parse CLI arguments
+  const wheelPath = process.argv[2];
+
+  if (!wheelPath) {
+    console.error("Usage: node test_pyodide_acceptance.mjs <wheel-path>");
+    console.error("Example: node test_pyodide_acceptance.mjs ./dist/marimo-0.1.0-py3-none-any.whl");
+    process.exit(1);
+  }
+
+  // Resolve to absolute path
+  const absoluteWheelPath = path.resolve(wheelPath);
+
+  // Check if wheel file exists
+  if (!fs.existsSync(absoluteWheelPath)) {
+    console.error(`Error: Wheel file not found: ${absoluteWheelPath}`);
+    process.exit(1);
+  }
+
+  console.log(`Testing wheel: ${absoluteWheelPath}`);
+  console.log("");
+
+  let serverInfo = null;
+
+  try {
+    // Step 1: Start wheel server
+    console.log("Step 1: Starting wheel server...");
+    serverInfo = await startWheelServer(absoluteWheelPath);
+    const wheelUrl = `http://127.0.0.1:${serverInfo.port}/${serverInfo.wheelFilename}`;
+    console.log(`Wheel URL: ${wheelUrl}`);
+    console.log("");
+
+    // Step 2: Load Pyodide
+    console.log("Step 2: Loading Pyodide...");
+    const { loadPyodide, version } = await loadPyodideModule();
+    console.log(`Pyodide version: ${version}`);
+
+    // In Node.js, loadPyodide uses the bundled files from the npm package
+    // Load without packages first, then add packages separately
+    const pyodide = await loadPyodide({ convertNullToNone: true });
+    console.log("Pyodide loaded successfully");
+
+    // Load required packages that marimo depends on
+    // Some packages are bundled with Pyodide, others need micropip
+    console.log("Loading required packages...");
+
+    // Load packages that are bundled with Pyodide
+    await pyodide.loadPackage(["micropip", "msgspec", "packaging", "pyodide_http", "docutils", "pygments", "jedi"]);
+
+    // Install packages via micropip that aren't bundled or need specific versions
+    // Note: narwhals>=2.0.0 is required by marimo, but Pyodide bundles an older version
+    const micropipPackages = ["Markdown", "pymdown-extensions", "narwhals>=2.0.0"];
+    console.log(`Installing via micropip: ${micropipPackages.join(", ")}...`);
+    await pyodide.runPythonAsync(`
+import micropip
+await micropip.install(${JSON.stringify(micropipPackages)})
+print("micropip packages installed")
+`);
+    console.log("Required packages loaded");
+    console.log("");
+
+    // Step 3: Install the marimo wheel
+    console.log("Step 3: Installing marimo wheel...");
+    await pyodide.loadPackage(wheelUrl);
+    console.log("Marimo wheel installed successfully");
+    console.log("");
+
+    // Step 4: Create a minimal notebook file for testing
+    console.log("Step 4: Setting up test notebook...");
+    pyodide.runPython(`
+import os
+
+# Create a minimal test notebook
+test_notebook = '''
+import marimo
+
+__generated_with = "0.0.0"
+app = marimo.App()
+
+@app.cell
+def test_cell():
+    x = 1 + 1
+    return x,
+
+if __name__ == "__main__":
+    app.run()
+'''
+
+# Write the test notebook to the filesystem
+os.makedirs('/home/pyodide', exist_ok=True)
+with open('/home/pyodide/test_notebook.py', 'w') as f:
+    f.write(test_notebook)
+
+print("Test notebook created at /home/pyodide/test_notebook.py")
+`);
+    console.log("");
+
+    // Step 5: Create session and verify bridge
+    console.log("Step 5: Creating session and verifying bridge...");
+
+    const result = await pyodide.runPythonAsync(`
+import json
+import asyncio
+
+# Collect the notifications the session sends on its notebook stream
+messages = []
+
+def receive(raw):
+    event = json.loads(raw)
+    if event["event"] == "marimo":
+        messages.append(event["data"]["marimo"])
+
+# Import and create session
+from marimo._pyodide.bootstrap import create_session, instantiate
+
+def init(auto_instantiate=True):
+    instantiate(session, auto_instantiate)
+    asyncio.create_task(session.start())
+
+session, bridge = create_session(
+    filename="/home/pyodide/test_notebook.py",
+    query_params={},
+    user_config={},
+)
+# This script stands in for the editor's worker, whose user can answer a prompt.
+bridge.notebook.allow_input()
+await bridge.notebook.subscribe("messages", None, receive)
+
+# Run the session
+init(session)
+
+# Verify session was created
+assert session is not None, "Session should not be None"
+print(f"Session created: {type(session).__name__}")
+
+# Verify bridge was created
+assert bridge is not None, "Bridge should not be None"
+print(f"Bridge created: {type(bridge).__name__}")
+
+# Verify bridge has expected methods
+expected_methods = [
+    "put_control_request",
+    "code_complete",
+    "read_code",
+    "read_snippets",
+    "format",
+    "save_app_config",
+    "save_user_config",
+    "rename_file",
+    "list_files",
+    "search_files",
+    "file_details",
+    "create_file_or_directory",
+    "delete_file_or_directory",
+    "move_file_or_directory",
+    "update_file",
+    "export_html",
+    "export_markdown",
+    "export_script",
+]
+
+missing_methods = []
+for method in expected_methods:
+    if not hasattr(bridge, method):
+        missing_methods.append(method)
+    else:
+        print(f"  - {method}: OK")
+
+if missing_methods:
+    raise AssertionError(f"Bridge missing methods: {missing_methods}")
+
+# Wait for the startup run to end, so the host stream below is quiet.
+while not any(msg["op"] == "completed-run" for msg in messages):
+    await asyncio.sleep(0.1)
+message_ops = [msg["op"] for msg in messages]
+
+print("Messages received:", message_ops);
+kernel_ready_received = "kernel-ready" in message_ops
+assert kernel_ready_received, "Should have received kernel-ready message"
+print("\\nKernelReady message received: OK")
+
+# Return summary
+result = {
+    "session_type": type(session).__name__,
+    "bridge_type": type(bridge).__name__,
+    "methods_verified": len(expected_methods),
+    "messages_received": len(messages),
+    "kernel_ready": kernel_ready_received,
+}
+json.dumps(result)
+`);
+
+    // Exercise the same Python proxy and callback lifetime as the worker RPC.
+    const notebook = pyodide.runPython("bridge.notebook");
+    const frames = [];
+    try {
+      // Host events only. Notifications follow them on the same stream.
+      await notebook.subscribe("acceptance", null, (raw) => {
+        const frame = JSON.parse(raw);
+        if (frame.event !== "marimo") {
+          frames.push(frame);
+        }
+      });
+      assert.equal(frames.at(-1).event, "ready");
+      const cell = frames.find((frame) => frame.event === "cell").data.cell;
+      await testIdleInterrupt(pyodide, notebook, cell.notebook_id, frames);
+      const call = JSON.stringify({
+        operation: "notebook.edit",
+        params: { notebook_id: cell.notebook_id },
+        headers: { "idempotency-key": "wasm-acceptance-edit" },
+        body: { changes: [{
+          kind: "put_cell", base_etag: cell.etag,
+          cell: { id: cell.id, code: "x = 7", name: cell.name, config: cell.config },
+        }] },
+      });
+      const reply = JSON.parse(await notebook.call(call));
+      assert.equal(reply.status, 200);
+      assert.deepEqual(frames.at(-1).data.document, reply.body.document);
+      assert.equal(frames.at(-2).data.cell.code, "x = 7");
+      assert.equal(frames.at(-1).data.request_id, "wasm-acceptance-edit");
+      const count = frames.length;
+      assert.deepEqual(JSON.parse(await notebook.call(call)), reply);
+      assert.equal(frames.length, count);
+      assert.equal(pyodide.runPython("list(session.app_manager.app.cell_manager.codes())[0]"), "x = 7");
+      notebook.set_persistence(async (contents, filename) => {
+        await Promise.resolve();
+        pyodide.FS.writeFile(filename, contents);
+      });
+      const save = JSON.stringify({
+        operation: "notebook.save",
+        params: { notebook_id: cell.notebook_id },
+        headers: { "idempotency-key": "wasm-acceptance-save" },
+        body: {},
+      });
+      const saved = JSON.parse(await notebook.call(save));
+      assert.equal(saved.status, 200);
+      assert.equal(saved.body.document.etag, saved.body.document.saved_etag);
+      assert.match(
+        pyodide.FS.readFile("/home/pyodide/test_notebook.py", { encoding: "utf8" }),
+        /x = 7/,
+      );
+
+      await testHostInputs(notebook, cell.notebook_id, frames);
+      notebook.unsubscribe("acceptance");
+    } finally {
+      notebook.destroy();
+    }
+
+    // Step 6: Test mo.watch.file in Pyodide (within execution context)
+    console.log("Step 6: Testing mo.watch.file in Pyodide...");
+
+    // Use bridge.put_control_request to run code within the marimo execution context
+    // This ensures runtime_context_installed() returns True
+    await pyodide.runPythonAsync(`
+import json
+from pathlib import Path
+
+# Create a test file first
+test_file_path = Path("/home/pyodide/watch_test.txt")
+test_file_path.write_text("initial content")
+print(f"Created test file: {test_file_path}")
+
+# Run code within the marimo execution context using the bridge
+# This simulates what happens when a cell runs mo.watch.file
+code_to_run = '''
+import marimo as mo
+from pathlib import Path
+
+# This should NOT throw an error in Pyodide - it should gracefully degrade
+# by logging a warning and returning a FileState that can still read/write
+test_file_path = Path("/home/pyodide/watch_test.txt")
+file_state = mo.watch.file(test_file_path)
+
+# Verify we can read the file
+content = file_state.read_text()
+assert content == "initial content", f"Expected 'initial content', got '{content}'"
+
+# Verify we can write to the file
+file_state.write_text("new content")
+updated_content = file_state.read_text()
+assert updated_content == "new content", f"Expected 'new content', got '{updated_content}'"
+
+# Verify basic Path methods still work
+assert file_state.exists(), "File should exist"
+assert file_state.name == "watch_test.txt", f"Expected 'watch_test.txt', got '{file_state.name}'"
+
+# Return success indicator
+file_state_type = type(file_state).__name__
+'''
+
+# Use the bridge to run the code in the execution context
+bridge.put_control_request(json.dumps({
+    "type": "execute-cells",
+    "executionRequests": [{"type": "execute-cell", "cellId": "test_watch_cell", "code": code_to_run}]
+}))
+
+# Wait for execution to complete
+await asyncio.sleep(1.0)
+
+# Verify the file was modified (proves write_text worked)
+final_content = test_file_path.read_text()
+assert final_content == "new content", f"Expected 'new content', got '{final_content}'"
+print(f"Final file content verified: '{final_content}' - OK")
+
+print("\\nmo.watch.file works correctly in Pyodide execution context!")
+`);
+
+    // Step 7: Test polars WASM I/O patches (read_csv / read_parquet / scan_csv)
+    //
+    // Sync HTTP isn't available in Node.js pyodide (no XHR shim, no
+    // SharedArrayBuffer/Atomics setup), so we can't exercise the URL fetch
+    // end-to-end through the wrapper here — that's covered by unit tests.
+    // Instead, verify two things in a real pyodide runtime: (1) the polars
+    // formatter actually wrapped pl.read_csv on import, and (2) the pyarrow
+    // fallback decoders return a polars DataFrame when called with bytes.
+    console.log("Step 7: Testing polars WASM I/O patches...");
+
+    // Load polars + pyarrow (pyarrow is the patch's fallback decoder).
+    await pyodide.loadPackage(["polars", "pyarrow"]);
+
+    await pyodide.runPythonAsync(`
+import io
+import polars as pl
+from marimo._runtime._wasm._polars import _make_fallback, _write_json_fallback
+
+# Importing polars triggers the formatter's register(), which calls
+# patch_polars_for_wasm() and wraps pl.read_csv etc. functools.wraps copies
+# __wrapped__, so we can confirm the wrapper is in place.
+assert hasattr(pl.read_csv, "__wrapped__"), "pl.read_csv should be wrapped in pyodide"
+assert hasattr(pl.scan_csv, "__wrapped__"), "pl.scan_csv should be wrapped in pyodide"
+assert hasattr(pl.read_parquet, "__wrapped__"), "pl.read_parquet should be wrapped in pyodide"
+print("  - polars I/O wrappers installed: OK")
+
+# Exercise the fallback decoders directly with bytes.
+csv_bytes = b"a,b\\n1,x\\n2,y\\n"
+df = _make_fallback("csv", lazy=False)(None, io.BytesIO(csv_bytes))
+assert df.shape == (2, 2), f"unexpected csv shape: {df.shape}"
+assert df.columns == ["a", "b"], f"unexpected csv columns: {df.columns}"
+assert df["b"].to_list() == ["x", "y"], f"unexpected csv values: {df['b'].to_list()}"
+print(f"  - csv fallback: {df.shape} OK")
+
+lf = _make_fallback("csv", lazy=True)(None, io.BytesIO(csv_bytes))
+assert isinstance(lf, pl.LazyFrame), f"expected LazyFrame, got {type(lf).__name__}"
+assert lf.collect().shape == (2, 2)
+print(f"  - scan_csv fallback returns LazyFrame: OK")
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+table = pa.table({"a": [1, 2], "b": ["x", "y"]})
+parquet_buf = io.BytesIO()
+pq.write_table(table, parquet_buf)
+df2 = _make_fallback("parquet", lazy=False)(None, io.BytesIO(parquet_buf.getvalue()))
+assert df2.shape == (2, 2), f"unexpected parquet shape: {df2.shape}"
+assert df2["b"].to_list() == ["x", "y"], f"unexpected parquet values: {df2['b'].to_list()}"
+print(f"  - parquet fallback: {df2.shape} OK")
+
+# write_json fallback handles temporal types (default=str).
+import datetime
+df3 = pl.DataFrame({
+    "a": [1, 2],
+    "d": [datetime.date(2026, 1, 1), datetime.date(2026, 1, 2)],
+})
+out = _write_json_fallback(None, df3)
+assert "2026-01-01" in out, f"expected serialized date in output: {out}"
+print(f"  - write_json fallback handles dates: OK")
+
+print("polars WASM I/O patches verified")
+`);
+    console.log("");
+
+    // Step 8: Test the streaming micropip install engine against real micropip.
+    //
+    // The engine drives micropip's private Transaction API. Its callers catch a
+    // mismatch and fall back to sequential installs, so drift is otherwise
+    // silent. Call the engine directly to make drift fail here.
+    console.log("Step 8: Testing streaming micropip install engine...");
+
+    await pyodide.runPythonAsync(`
+from marimo._runtime.packages._micropip_streaming import (
+    stream_transaction_install,
+)
+
+# Pyodide bundles neither package, so both resolve through the Transaction
+# path rather than loadPackage. Assert on the installs, not on the private
+# names, so any future rename still surfaces here.
+results = {}
+async for name, ok in stream_transaction_install(["cowsay", "shortuuid"]):
+    results[name] = ok
+print(f"  - stream results: {results}")
+assert results == {"cowsay": True, "shortuuid": True}, f"unexpected results: {results}"
+
+# Importable now, so the wheels really installed.
+import cowsay  # noqa: F401
+import shortuuid  # noqa: F401
+print("  - both packages importable: OK")
+
+print("streaming micropip install engine verified")
+`);
+    console.log("");
+
+    console.log("");
+    console.log("Verification results:", result);
+    console.log("");
+
+    // Success
+    console.log("=".repeat(50));
+    console.log("SUCCESS: All acceptance tests passed!");
+    console.log("=".repeat(50));
+
+    // Cleanup
+    serverInfo.server.close();
+    process.exit(0);
+  } catch (error) {
+    console.error("");
+    console.error("=".repeat(50));
+    console.error("FAILURE: Acceptance test failed!");
+    console.error("=".repeat(50));
+    console.error("");
+    console.error("Error:", error.message || error);
+
+    if (error.stack) {
+      console.error("");
+      console.error("Stack trace:");
+      console.error(error.stack);
+    }
+
+    // Cleanup
+    if (serverInfo?.server) {
+      serverInfo.server.close();
+    }
+    process.exit(1);
+  }
+}
+
+main();

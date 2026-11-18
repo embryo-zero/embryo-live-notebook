@@ -1,0 +1,225 @@
+# Copyright 2026 Marimo. All rights reserved.
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from marimo._session.consumer_policy import initial_capabilities
+
+if TYPE_CHECKING:
+    from starlette.requests import HTTPConnection
+
+    from marimo._server.api.endpoints.ws.session_handler import SessionHandler
+    from marimo._server.api.endpoints.ws.ws_connection_validator import (
+        ConnectionParams,
+    )
+    from marimo._server.session_manager import SessionManager
+    from marimo._session import Session
+
+from starlette.datastructures import QueryParams as StarletteQueryParams
+from starlette.websockets import WebSocketDisconnect
+
+from marimo import _loggers
+from marimo._messaging.types import NoopStream
+from marimo._runtime.params import QueryParams
+from marimo._server.codes import WebSocketCloseReason, WebSocketCodes
+from marimo._session.model import ConnectionState, SessionMode
+from marimo._session.requests import InstantiateNotebookRequest
+
+LOGGER = _loggers.marimo_logger()
+
+
+class SessionConnector:
+    """Handles different session connection strategies."""
+
+    def __init__(
+        self,
+        manager: SessionManager,
+        handler: SessionHandler,
+        params: ConnectionParams,
+        connection: HTTPConnection,
+    ):
+        self.manager = manager
+        self.handler = handler
+        self.params = params
+        self.connection = connection
+
+    async def connect(self) -> None:
+        """Establish a session connection.
+
+        Raises:
+            WebSocketDisconnect: If the connection cannot be established.
+        """
+        async with self.manager.connection_lock(
+            self.params.session_id, self.params.file_key
+        ):
+            await self._connect()
+
+    async def _connect(self) -> None:
+        # 1. Kiosk mode
+        if self.params.kiosk:
+            await self._connect_kiosk()
+            return
+
+        # A completed launch may still be waiting for its first connection.
+        if self.manager.is_session_starting(
+            self.params.session_id, self.params.file_key
+        ):
+            await self._create_new_session()
+            return
+
+        # 2. Reconnect to existing session with same ID
+        existing_by_id = self.manager.get_session(self.params.session_id)
+        if existing_by_id is not None:
+            await self.handler._prepare_session(existing_by_id)
+            self._reconnect_session(existing_by_id)
+            return
+
+        # 3. Viewer only mode: a second connection request is auto routed as reader only
+        existing_by_file = self.manager.get_session_by_file_key(
+            self.params.file_key
+        )
+        session_in_edit_mode = self.manager.mode == SessionMode.EDIT
+        if (
+            existing_by_file is not None
+            and session_in_edit_mode
+            and not initial_capabilities(existing_by_file, self.params).edit
+        ):
+            await self._connect_kiosk()
+            return
+
+        # 4. Resume previous session
+        resumable = self.manager.maybe_resume_session(
+            self.params.session_id, self.params.file_key
+        )
+        if resumable is not None:
+            await self.handler._prepare_session(resumable)
+            self._resume_session(resumable)
+            return
+
+        # 5. Create new session
+        await self._create_new_session()
+
+    async def _connect_kiosk(self) -> None:
+        """Connect to kiosk session.
+
+        Raises:
+            WebSocketDisconnect: If kiosk mode is not supported or session
+                not found.
+        """
+        if self.manager.mode is not SessionMode.EDIT:
+            LOGGER.debug("Kiosk mode is only supported in edit mode")
+            raise WebSocketDisconnect(
+                WebSocketCodes.FORBIDDEN,
+                WebSocketCloseReason.KIOSK_NOT_ALLOWED,
+            )
+
+        # Try to find session by ID first
+        kiosk_session = self.manager.get_session(self.params.session_id)
+        if kiosk_session is None:
+            LOGGER.debug(
+                "Kiosk session not found for session id %s",
+                self.params.session_id,
+            )
+            # Try to find by file key
+            kiosk_session = self.manager.get_session_by_file_key(
+                self.params.file_key
+            )
+
+        if kiosk_session is None:
+            LOGGER.debug(
+                "Kiosk session not found for file key %s",
+                self.params.file_key,
+            )
+            raise WebSocketDisconnect(
+                WebSocketCodes.NORMAL_CLOSE, WebSocketCloseReason.NO_SESSION
+            )
+
+        LOGGER.debug("Connecting to kiosk session")
+        await self.handler._prepare_session(kiosk_session)
+        self.handler._connect_kiosk(kiosk_session)
+
+    def _reconnect_session(self, session: Session) -> None:
+        """Reconnect to existing session.
+
+        The session already exists, but it was disconnected. This can happen
+        in local development when the client goes to sleep and wakes later.
+        """
+        LOGGER.debug("Reconnecting session %s", self.params.session_id)
+        # In case there is a lingering connection, close it
+        session.disconnect_main_consumer()
+        self.handler._reconnect_session(session, replay=False)
+
+    def _resume_session(self, session: Session) -> None:
+        """Resume a previous session."""
+        LOGGER.debug("Resuming session %s", self.params.session_id)
+        self.handler._reconnect_session(session, replay=True)
+
+    @property
+    def _is_run_mode(self) -> bool:
+        """Check if we're in run mode (read-only app mode)."""
+        return self.manager.mode == SessionMode.RUN
+
+    async def _create_new_session(self) -> None:
+        """Create a new session.
+
+        Grabs query params from the connection and creates a new session
+        with the session manager.
+        """
+
+        # Note: if we resume a session, we don't pick up the new query
+        # params, and instead use the query params from when the
+        # session was created.
+        query_params = self._extract_query_params()
+
+        new_session = await self.manager.create_session(
+            query_params=query_params.to_dict(),
+            session_id=self.params.session_id,
+            session_consumer=self.handler,
+            file_key=self.params.file_key,
+            auto_instantiate=self.params.auto_instantiate,
+            main=True,
+        )
+
+        await self.handler._prepare_session(new_session)
+        self._notify_kernel_ready(new_session)
+
+        # In run mode, auto-instantiate server-side (frontend won't call it)
+        if self._is_run_mode:
+            self._auto_instantiate(new_session)
+
+    def _extract_query_params(self) -> QueryParams:
+        """Read notebook parameters independently of stream options."""
+        params = StarletteQueryParams(
+            self.connection.query_params.get("query_params", "")
+        )
+        query_params = QueryParams({}, NoopStream())
+        for key, value in params.multi_items():
+            if key not in QueryParams.IGNORED_KEYS:
+                query_params.append(key, value)
+        return query_params
+
+    def _notify_kernel_ready(self, session: Session) -> None:
+        """Send kernel-ready notification to the frontend."""
+        self.handler.status = ConnectionState.CONNECTING
+        self.handler._write_kernel_ready(
+            session,
+            resumed=False,
+            ui_values={},
+            kiosk=False,
+            auto_instantiated=self._is_run_mode,
+        )
+        self.handler.status = ConnectionState.OPEN
+        self.handler._replay_previous_session(session)
+
+    def _auto_instantiate(self, session: Session) -> None:
+        """Auto-instantiate the session (used in run mode)."""
+        from marimo._runtime.commands import HTTPRequest
+
+        session.instantiate(
+            InstantiateNotebookRequest(
+                object_ids=[],
+                values=[],
+                auto_run=True,
+            ),
+            http_request=HTTPRequest.from_request(self.connection),
+        )

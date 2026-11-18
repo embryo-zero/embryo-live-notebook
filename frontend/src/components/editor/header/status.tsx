@@ -1,0 +1,128 @@
+/* Copyright 2026 Marimo. All rights reserved. */
+
+import { useAtomValue } from "jotai";
+import { HourglassIcon, UnlinkIcon } from "lucide-react";
+import React from "react";
+import { Tooltip } from "@/components/ui/tooltip";
+import { notebookScrollToRunning } from "@/core/cells/actions";
+import { cellExecutionInputsAtom, onlyScratchRunning } from "@/core/executions";
+import { viewStateAtom } from "@/core/mode";
+import {
+  type ConnectionStatus,
+  WebSocketClosedReason,
+  ConnectionState,
+} from "@/core/session/types";
+import { cn } from "@/utils/cn";
+
+export const StatusOverlay: React.FC<{
+  connection: ConnectionStatus;
+  isRunning: boolean;
+  onReconnect?: () => void;
+}> = ({ connection, isRunning, onReconnect }) => {
+  const { mode } = useAtomValue(viewStateAtom);
+  const isClosed =
+    connection.state === ConnectionState.CLOSED &&
+    (mode === "read" ||
+      connection.code !== WebSocketClosedReason.KERNEL_STARTUP_ERROR);
+  const isOpen = connection.state === ConnectionState.OPEN;
+  // Editor startup failures have their own recovery UI.
+  const canReconnect =
+    isClosed && connection.code === WebSocketClosedReason.KERNEL_DISCONNECTED;
+
+  return (
+    <>
+      {isClosed && <NoiseBackground />}
+      <div
+        className={cn(
+          "z-50 top-4 left-4",
+          mode === "read" ? "fixed" : "absolute",
+        )}
+      >
+        {isOpen && isRunning && <RunningIcon />}
+        {isClosed && (
+          <DisconnectedIcon
+            onReconnect={canReconnect ? onReconnect : undefined}
+          />
+        )}
+      </div>
+    </>
+  );
+};
+
+const topLeftStatus = "print:hidden pointer-events-auto hover:cursor-pointer";
+
+const DisconnectedIcon: React.FC<{ onReconnect?: () => void }> = ({
+  onReconnect,
+}) => {
+  const disabled = !onReconnect;
+  return (
+    <Tooltip
+      content={
+        disabled ? "App disconnected" : "App disconnected — click to reconnect"
+      }
+    >
+      <button
+        type="button"
+        className={cn(topLeftStatus, "bg-transparent border-0 p-0")}
+        aria-label={disabled ? "App disconnected" : "Reconnect to app"}
+        data-testid="disconnected-indicator"
+        onClick={onReconnect}
+        // Keep the tooltip reachable by keyboard when reconnection is unavailable.
+        aria-disabled={disabled}
+      >
+        <UnlinkIcon className="w-[25px] h-[25px] text-(--red-11)" />
+      </button>
+    </Tooltip>
+  );
+};
+
+const RunningIcon = () => {
+  const scratchpadOnly = onlyScratchRunning(
+    useAtomValue(cellExecutionInputsAtom).executions,
+  );
+  const tooltip = scratchpadOnly
+    ? "Scratchpad is running"
+    : "Jump to running cell";
+
+  const icon = (
+    <HourglassIcon className="running-app-icon" size={30} strokeWidth={1} />
+  );
+
+  if (scratchpadOnly) {
+    return (
+      <Tooltip content={tooltip} side="right">
+        <span
+          className={topLeftStatus}
+          data-testid="loading-indicator"
+          // Execution progress is advisory status, not a form result.
+          // eslint-disable-next-line jsx-a11y/prefer-tag-over-role
+          role="status"
+          aria-label={tooltip}
+        >
+          {icon}
+        </span>
+      </Tooltip>
+    );
+  }
+
+  return (
+    <Tooltip content={tooltip} side="right">
+      <button
+        type="button"
+        aria-label={tooltip}
+        className={cn(topLeftStatus, "bg-transparent border-0 p-0")}
+        data-testid="loading-indicator"
+        onClick={notebookScrollToRunning}
+      >
+        {icon}
+      </button>
+    </Tooltip>
+  );
+};
+
+const NoiseBackground = () => (
+  <>
+    <div className="noise" />
+    <div className="disconnected-gradient" />
+  </>
+);

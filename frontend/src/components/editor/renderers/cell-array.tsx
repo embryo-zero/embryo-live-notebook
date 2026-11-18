@@ -1,0 +1,317 @@
+/* Copyright 2026 Marimo. All rights reserved. */
+
+import {
+  horizontalListSortingStrategy,
+  SortableContext,
+  verticalListSortingStrategy,
+} from "@dnd-kit/sortable";
+import { useAtomValue } from "jotai";
+import { DatabaseIcon, SquareCodeIcon, SquareMIcon } from "lucide-react";
+import { useEffect } from "react";
+import { StartupLogsAlert } from "@/components/editor/alerts/startup-logs-alert";
+import { Cell } from "@/components/editor/notebook-cell";
+import { PackageAlert } from "@/components/editor/package-alert";
+import { SortableCellsProvider } from "@/components/sort/SortableCellsProvider";
+import { Button } from "@/components/ui/button";
+import { maybeAddMarimoImport } from "@/core/cells/add-missing-import";
+import { SETUP_CELL_ID } from "@/core/cells/ids";
+import { LanguageAdapters } from "@/core/codemirror/language/LanguageAdapters";
+import { MARKDOWN_INITIAL_HIDE_CODE } from "@/core/codemirror/language/languages/markdown";
+import { canInteractWithAppAtom } from "@/core/network/connection";
+import { cn } from "@/utils/cn";
+import { Functions } from "@/utils/functions";
+import { type CellColumnId, findColumn, useLayout } from "@/core/cells/layout";
+import { invariant } from "@/utils/invariant";
+import { useCellIds, useScrollKey } from "../../../core/cells/cells";
+import { useCellActions } from "../../../core/cells/actions";
+import { formatAll } from "../../../core/codemirror/format";
+import type { AppConfig, UserConfig } from "../../../core/config/config-schema";
+import type { AppMode } from "../../../core/mode";
+import { useHotkey } from "../../../hooks/useHotkey";
+import { type Theme, useTheme } from "../../../theme/useTheme";
+import { FloatingOutline } from "../chrome/panels/outline/floating-outline";
+import { useChromeActions } from "../chrome/state";
+import { Column } from "../columns/cell-column";
+import { NotebookBanner } from "../notebook-banner";
+import { StdinBlockingAlert } from "../stdin-blocking-alert";
+import { useFocusFirstEditor } from "./vertical-layout/useFocusFirstEditor";
+import { VerticalLayoutWrapper } from "./vertical-layout/vertical-layout-wrapper";
+
+interface CellArrayProps {
+  mode: AppMode;
+  userConfig: UserConfig;
+  appConfig: AppConfig;
+  hideControls?: boolean;
+}
+
+export const CellArray: React.FC<CellArrayProps> = (props) => {
+  const columnIds = useLayout().columns.map((column) => column.id);
+
+  // Setup context for sorting
+  return (
+    <SortableCellsProvider multiColumn={props.appConfig.width === "columns"}>
+      <SortableContext
+        data-testid="column-container"
+        items={columnIds}
+        strategy={horizontalListSortingStrategy}
+      >
+        <CellArrayInternal {...props} />
+      </SortableContext>
+    </SortableCellsProvider>
+  );
+};
+
+const CellArrayInternal: React.FC<CellArrayProps> = ({
+  mode,
+  userConfig,
+  appConfig,
+  hideControls = false,
+}) => {
+  const actions = useCellActions();
+  const { theme } = useTheme();
+  const { toggleSidebarPanel } = useChromeActions();
+
+  const isPresenting = mode === "present";
+
+  // Side-effects
+  useFocusFirstEditor();
+
+  // HOTKEYS
+  // Cell-editing hotkeys are disabled while presenting
+  const whilePresenting = { disabled: isPresenting };
+  useHotkey("global.focusTop", actions.focusTopCell, whilePresenting);
+  useHotkey("global.focusBottom", actions.focusBottomCell, whilePresenting);
+  useHotkey("global.toggleSidebar", toggleSidebarPanel);
+  useHotkey("global.foldCode", actions.foldAll, whilePresenting);
+  useHotkey("global.unfoldCode", actions.unfoldAll, whilePresenting);
+  useHotkey(
+    "global.formatAll",
+    () => {
+      formatAll();
+    },
+    whilePresenting,
+  );
+  // Catch all to avoid native OS behavior
+  // Otherwise a user might try to hide a cell and accidentally hide the OS
+  // window. While presenting, no cell editing is possible, so let the
+  // keystrokes reach the browser/OS.
+  useHotkey("cell.hideCode", Functions.NOOP, whilePresenting);
+  useHotkey("cell.format", Functions.NOOP, whilePresenting);
+
+  const cellIds = useCellIds();
+  const scrollKey = useScrollKey();
+  const columnIds = useLayout().columns.map((column) => column.id);
+
+  // Scroll to a cell targeted by a previous action
+  const scrollToTarget = actions.scrollToTarget;
+  useEffect(() => {
+    if (scrollKey !== null) {
+      scrollToTarget();
+    }
+  }, [cellIds, scrollKey, scrollToTarget]);
+
+  return (
+    <VerticalLayoutWrapper
+      // 'pb' allows the user to put the cell in the middle of the screen
+      className={cn(!isPresenting && "pb-[40vh]")}
+      invisible={false}
+      appConfig={appConfig}
+      // 'pr' makes room for the floating actions
+      innerClassName={cn(!isPresenting && "pr-4")}
+    >
+      <PackageAlert />
+      <StartupLogsAlert />
+      <StdinBlockingAlert />
+      <NotebookBanner width={appConfig.width} />
+      <div
+        className={cn(
+          appConfig.width === "columns" &&
+            "grid grid-flow-col auto-cols-min gap-6",
+        )}
+      >
+        {columnIds.map((columnId, index) => (
+          <CellColumn
+            key={columnId}
+            columnId={columnId}
+            index={index}
+            columnsLength={columnIds.length}
+            appConfig={appConfig}
+            mode={mode}
+            userConfig={userConfig}
+            theme={theme}
+            hideControls={hideControls}
+          />
+        ))}
+      </div>
+      <FloatingOutline />
+    </VerticalLayoutWrapper>
+  );
+};
+
+/**
+ * A single column of cells.
+ */
+const CellColumn: React.FC<{
+  columnId: CellColumnId;
+  index: number;
+  columnsLength: number;
+  appConfig: AppConfig;
+  mode: AppMode;
+  userConfig: UserConfig;
+  theme: Theme;
+  hideControls: boolean;
+}> = ({
+  columnId,
+  index,
+  columnsLength,
+  appConfig,
+  mode,
+  userConfig,
+  theme,
+  hideControls,
+}) => {
+  const cellIds = useCellIds();
+  const column = findColumn(useLayout(), columnId);
+  invariant(column, `Expected column for: ${columnId}`);
+
+  const hasOnlyOneCell = cellIds.length === 1;
+  const hasSetupCell = cellIds.includes(SETUP_CELL_ID);
+  const isPresenting = mode === "present";
+
+  return (
+    <Column
+      columnId={columnId}
+      index={index}
+      canMoveLeft={index > 0}
+      canMoveRight={index < columnsLength - 1}
+      width={appConfig.width}
+      canDelete={columnsLength > 1}
+      presenting={isPresenting}
+      footer={
+        hideControls || isPresenting ? null : (
+          <AddCellButtons
+            columnId={columnId}
+            className={cn(
+              appConfig.width === "columns" &&
+                "opacity-0 group-hover/column:opacity-100",
+            )}
+          />
+        )
+      }
+    >
+      <SortableContext
+        id={`column-${index + 1}`}
+        items={[...column.visible]}
+        strategy={verticalListSortingStrategy}
+      >
+        {/* Render the setup cell first, always */}
+        {index === 0 && hasSetupCell && (
+          <Cell
+            key={SETUP_CELL_ID}
+            cellId={SETUP_CELL_ID}
+            theme={theme}
+            showPlaceholder={false}
+            canDelete={true}
+            mode={mode}
+            userConfig={userConfig}
+            isCollapsed={false}
+            collapseCount={0}
+            canMoveX={false}
+          />
+        )}
+
+        {column.visible.map((cellId) => {
+          // Skip the setup cell later
+          if (cellId === SETUP_CELL_ID) {
+            return null;
+          }
+
+          return (
+            <Cell
+              key={cellId}
+              cellId={cellId}
+              theme={theme}
+              showPlaceholder={hasOnlyOneCell}
+              canDelete={!hasOnlyOneCell}
+              mode={mode}
+              userConfig={userConfig}
+              isCollapsed={column.folds.has(cellId)}
+              collapseCount={column.folds.get(cellId)?.length ?? 0}
+              canMoveX={appConfig.width === "columns"}
+            />
+          );
+        })}
+      </SortableContext>
+    </Column>
+  );
+};
+
+export const AddCellButtons: React.FC<{
+  columnId: CellColumnId;
+  className?: string;
+}> = ({ columnId, className }) => {
+  const { createCell } = useCellActions();
+  const canInteractWithApp = useAtomValue(canInteractWithAppAtom);
+
+  const buttonClass = cn(
+    "mb-0 rounded-none sm:px-4 md:px-5 lg:px-8 tracking-wide no-wrap whitespace-nowrap",
+    "font-semibold opacity-70 hover:opacity-90 uppercase text-xs",
+  );
+
+  return (
+    <div className="flex justify-center mt-4 pt-6 pb-32 group gap-4 w-full print:hidden">
+      <div
+        className={cn(
+          "border border-border rounded transition-all duration-200 overflow-hidden divide-x divide-border flex w-fit shadow-sm-solid-shade",
+          className,
+        )}
+      >
+        <Button
+          className={buttonClass}
+          variant="text"
+          size="sm"
+          disabled={!canInteractWithApp}
+          onClick={() => createCell({ endOf: columnId })}
+        >
+          <SquareCodeIcon className="mr-2 size-4 shrink-0" />
+          Python
+        </Button>
+        <Button
+          className={buttonClass}
+          variant="text"
+          size="sm"
+          disabled={!canInteractWithApp}
+          onClick={() => {
+            maybeAddMarimoImport({ autoInstantiate: true, createCell });
+
+            createCell({
+              endOf: columnId,
+              code: LanguageAdapters.markdown.defaultCode,
+              config: { hide_code: MARKDOWN_INITIAL_HIDE_CODE },
+            });
+          }}
+        >
+          <SquareMIcon className="mr-2 size-4 shrink-0" />
+          Markdown
+        </Button>
+        <Button
+          className={buttonClass}
+          variant="text"
+          size="sm"
+          disabled={!canInteractWithApp}
+          onClick={() => {
+            maybeAddMarimoImport({ autoInstantiate: true, createCell });
+
+            createCell({
+              endOf: columnId,
+              code: LanguageAdapters.sql.defaultCode,
+            });
+          }}
+        >
+          <DatabaseIcon className="mr-2 size-4 shrink-0" />
+          SQL
+        </Button>
+      </div>
+    </div>
+  );
+};

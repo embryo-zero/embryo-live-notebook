@@ -1,0 +1,495 @@
+# Copyright 2026 Marimo. All rights reserved.
+from __future__ import annotations
+
+import os
+import random
+import tempfile
+from pathlib import Path
+from typing import TYPE_CHECKING
+from unittest.mock import Mock, patch
+
+import pytest
+
+from marimo._utils.platform import is_windows
+from tests._server.api.endpoints.ws_helpers import receive_notification
+from tests._server.mocks import (
+    get_session_manager,
+    get_single_notebook_id,
+    run_cells,
+    token_header,
+    with_read_session,
+    with_session,
+    with_websocket_session,
+)
+from tests.mocks import EDGE_CASE_FILENAMES
+from tests.utils import try_assert_n_times
+
+if TYPE_CHECKING:
+    from starlette.testclient import TestClient, WebSocketTestSession
+
+SESSION_ID = "session-123"
+HEADERS = {
+    "Marimo-Session-Id": SESSION_ID,
+    **token_header("fake-token"),
+}
+
+
+@with_session(SESSION_ID)
+def test_rename(client: TestClient) -> None:
+    current_filename = get_session_manager(
+        client
+    ).workspace.get_unique_file_key()
+
+    assert current_filename
+    current_path = Path(current_filename)
+    assert current_path.exists()
+
+    directory = current_path.parent
+    random_name = random.randint(0, 100000)
+    new_path = directory / f"test_{random_name}.py"
+
+    response = client.post(
+        "/api/kernel/rename",
+        headers=HEADERS,
+        json={
+            "filename": str(new_path),
+        },
+    )
+    assert response.json() == {"success": True}
+
+    def _new_path_exists():
+        assert new_path.exists()
+
+    try_assert_n_times(5, _new_path_exists)
+
+
+@with_session(SESSION_ID)
+def test_rename_prepares_file_before_notifying_kernel(
+    client: TestClient,
+) -> None:
+    session = get_session_manager(client).get_session(SESSION_ID)
+    assert session is not None
+    assert session.app_file_manager.path is not None
+    original = Path(session.app_file_manager.path)
+    renamed = original.with_name(f"{original.stem}_renamed.py")
+
+    def notify(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        assert renamed.exists()
+        assert not original.exists()
+        assert session.app_file_manager.path == str(renamed)
+
+    with patch.object(
+        session, "put_control_request", side_effect=notify
+    ) as put:
+        response = client.post(
+            "/api/kernel/rename",
+            headers=HEADERS,
+            json={"filename": str(renamed)},
+        )
+    assert response.json() == {"success": True}
+    put.assert_called_once()
+
+
+@with_session(SESSION_ID)
+def test_failed_rename_does_not_notify_kernel(client: TestClient) -> None:
+    session = get_session_manager(client).get_session(SESSION_ID)
+    assert session is not None
+    assert session.app_file_manager.path is not None
+    original = Path(session.app_file_manager.path)
+    occupied = original.with_name(f"{original.stem}_occupied.py")
+    occupied.write_text("# An unrelated notebook\n")
+    with patch.object(session, "put_control_request") as put:
+        response = client.post(
+            "/api/kernel/rename",
+            headers=HEADERS,
+            json={"filename": str(occupied)},
+        )
+    assert response.status_code == 400
+    put.assert_not_called()
+    assert occupied.read_text() == "# An unrelated notebook\n"
+
+
+@pytest.mark.flaky(reruns=5)
+@with_session(SESSION_ID)
+def test_read_code(client: TestClient) -> None:
+    source = """import marimo
+
+app = marimo.App()
+
+@app.cell
+async def _():
+    import asyncio
+    await asyncio.sleep(0)
+    return
+"""
+    session = get_session_manager(client).get_session(SESSION_ID)
+    assert session
+    assert session.app_file_manager.path
+    Path(session.app_file_manager.path).write_text(source, encoding="utf-8")
+
+    response = client.post(
+        "/api/kernel/read_code",
+        headers=HEADERS,
+        json={},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["contents"] == source
+
+
+@with_read_session(SESSION_ID, include_code=True)
+def test_read_code_in_run_mode_with_include_code(client: TestClient) -> None:
+    """Test read_code works in run mode when include_code=True."""
+    response = client.post(
+        "/api/kernel/read_code",
+        headers=HEADERS,
+        json={},
+    )
+    assert response.status_code == 200, response.text
+    assert "import marimo" in response.json()["contents"]
+
+
+@with_read_session(SESSION_ID, include_code=False)
+def test_read_code_in_run_mode_without_include_code(
+    client: TestClient,
+) -> None:
+    """Test read_code is not accessible in run mode when include_code=False."""
+    response = client.post(
+        "/api/kernel/read_code",
+        headers=HEADERS,
+        json={},
+    )
+    # Should be denied 401 (unauthorized) or 403 (forbidden)
+    assert response.status_code in [401, 403]
+
+
+@pytest.mark.flaky(reruns=5)
+@with_session(SESSION_ID)
+def test_save_layout(client: TestClient) -> None:
+    filename = get_session_manager(client).workspace.get_unique_file_key()
+    assert filename
+    path = Path(filename)
+    response = client.post(
+        "/api/kernel/rename",
+        headers=HEADERS,
+        json={"filename": str(path)},
+    )
+    assert response.status_code == 200, response.text
+    manager = get_session_manager(client).get_session(SESSION_ID)
+    assert manager is not None
+    app = manager.app_file_manager.app
+
+    response = client.post(
+        "/api/kernel/save_layout",
+        headers=HEADERS,
+        json={
+            "layout": {"type": "grid", "data": {"columns": 24, "cells": []}}
+        },
+    )
+    assert response.status_code == 200, response.text
+    layout_file = app.config.layout_file
+    assert layout_file == f"layouts/{path.stem}.grid.json"
+    assert (path.parent / layout_file).exists()
+
+    response = client.post(
+        "/api/kernel/save_layout",
+        headers=HEADERS,
+        json={"layout": None},
+    )
+    assert response.status_code == 200, response.text
+    assert app.config.layout_file is None
+
+
+@pytest.mark.flaky(reruns=5)
+@with_session(SESSION_ID)
+def test_save_app_config(client: TestClient) -> None:
+    filename = get_session_manager(client).workspace.get_unique_file_key()
+    assert filename
+    path = Path(filename)
+
+    def _wait_for_file_reset():
+        file_contents = path.read_text()
+        assert 'marimo.App(width="medium"' not in file_contents
+
+    try_assert_n_times(5, _wait_for_file_reset)
+
+    response = client.post(
+        "/api/kernel/save_app_config",
+        headers=HEADERS,
+        json={
+            "config": {"width": "medium"},
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert "import marimo" in response.text
+
+    def _assert_contents():
+        file_contents = path.read_text()
+        assert 'marimo.App(width="medium"' in file_contents
+
+    try_assert_n_times(5, _assert_contents)
+
+
+@with_session(SESSION_ID)
+def test_copy_file(client: TestClient) -> None:
+    filename = get_session_manager(client).workspace.get_unique_file_key()
+    assert filename
+    path = Path(filename)
+    assert path.exists()
+    file_contents = path.read_text()
+    assert "import marimo as mo" in file_contents
+    assert 'marimo.App(width="full"' in file_contents
+
+    filename_copy = f"_{os.path.basename(filename)}"
+    copied_file = os.path.join(os.path.dirname(filename), filename_copy)
+    response = client.post(
+        "/api/kernel/copy",
+        headers=HEADERS,
+        json={
+            "source": filename,
+            "destination": copied_file,
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert filename_copy in response.text
+
+    def _assert_contents():
+        file_contents = Path(copied_file).read_text()
+        assert "import marimo as mo" in file_contents
+        assert 'marimo.App(width="full"' in file_contents
+
+    try_assert_n_times(5, _assert_contents)
+
+
+@with_session(SESSION_ID)
+def test_copy_file_with_relative_paths(client: TestClient) -> None:
+    """Test that copy works with relative paths when workspace has a directory."""
+    filename = get_session_manager(client).workspace.get_unique_file_key()
+    assert filename
+    path = Path(filename)
+    assert path.exists()
+    file_contents = path.read_text()
+    assert "import marimo as mo" in file_contents
+
+    # Get the directory and mock the workspace.directory property to simulate
+    # running from a subdirectory (marimo edit foo/dir/)
+    directory = str(path.parent)
+    workspace = get_session_manager(client).workspace
+
+    # Use relative paths (as the frontend would send when running from a
+    # subdirectory)
+    source_relative = path.name
+    dest_relative = f"_copy_{path.name}"
+    copied_file = path.parent / dest_relative
+
+    # Mock the directory property on the workspace
+    with patch.object(
+        type(workspace),
+        "directory",
+        new_callable=lambda: property(lambda _: directory),
+    ):
+        response = client.post(
+            "/api/kernel/copy",
+            headers=HEADERS,
+            json={
+                "source": source_relative,
+                "destination": dest_relative,
+            },
+        )
+        assert response.status_code == 200, response.text
+        assert dest_relative in response.text
+
+    def _assert_contents():
+        file_contents = copied_file.read_text()
+        assert "import marimo as mo" in file_contents
+        assert 'marimo.App(width="full"' in file_contents
+
+    try_assert_n_times(5, _assert_contents)
+
+
+@with_session(SESSION_ID)
+def test_path_traversal_rename_blocked(client: TestClient) -> None:
+    """Rename endpoint must not move files outside the workspace's directory."""
+    filename = get_session_manager(client).workspace.get_unique_file_key()
+    assert filename
+    path = Path(filename)
+    directory = str(path.parent)
+    workspace = get_session_manager(client).workspace
+
+    with patch.object(
+        type(workspace),
+        "directory",
+        new_callable=lambda: property(lambda _: directory),
+    ):
+        traversal_path = str(path.parent.parent / "escaped.py")
+        response = client.post(
+            "/api/kernel/rename",
+            headers=HEADERS,
+            json={"filename": traversal_path},
+        )
+        assert response.status_code == 403, response.text
+
+
+@with_session(SESSION_ID)
+def test_path_traversal_copy_blocked(client: TestClient) -> None:
+    """Copy endpoint must not write outside the workspace's directory."""
+    filename = get_session_manager(client).workspace.get_unique_file_key()
+    assert filename
+    path = Path(filename)
+    directory = str(path.parent)
+    workspace = get_session_manager(client).workspace
+
+    with patch.object(
+        type(workspace),
+        "directory",
+        new_callable=lambda: property(lambda _: directory),
+    ):
+        traversal_dest = str(path.parent.parent / "escaped.py")
+        response = client.post(
+            "/api/kernel/copy",
+            headers=HEADERS,
+            json={
+                "source": filename,
+                "destination": traversal_dest,
+            },
+        )
+        assert response.status_code == 403, response.text
+
+
+@with_websocket_session(SESSION_ID)
+def test_rename_propagates(
+    client: TestClient, websocket: WebSocketTestSession
+) -> None:
+    current_filename = get_session_manager(
+        client
+    ).workspace.get_unique_file_key()
+
+    assert current_filename
+    assert os.path.exists(current_filename)
+
+    initial_response = run_cells(
+        client,
+        get_single_notebook_id(client),
+        {"cell-1": "b = __file__", "cell-2": "a = 'x' + __file__"},
+        headers=HEADERS,
+    )
+    assert initial_response.status_code == 202, initial_response.text
+
+    variables = {}
+    while len(variables) < 2:
+        data = receive_notification(websocket)
+        if data["op"] == "variable-values":
+            for var in data["data"]["variables"]:
+                # Revisions arrive before their rendered previews.
+                if var["value"] is not None:
+                    variables[var["name"]] = var["value"]
+
+    # Variable outputs are truncated to 50 characters
+    # current_filename can exceed this count on windows and OSX.
+    assert ("x" + current_filename).startswith(variables["a"])
+    assert current_filename.startswith(variables["b"])
+
+    directory = os.path.dirname(current_filename)
+    random_name = random.randint(0, 100000)
+    new_filename = os.path.join(directory, f"test_{random_name}.py")
+
+    response = client.post(
+        "/api/kernel/rename",
+        headers=HEADERS,
+        json={
+            "filename": new_filename,
+        },
+    )
+    assert response.json() == {"success": True}
+    assert response.status_code == 200, response.text
+
+    variables = {}
+    while len(variables) < 2:
+        data = receive_notification(websocket)
+        if data["op"] == "variable-values":
+            for var in data["data"]["variables"]:
+                # Revisions arrive before their rendered previews.
+                if var["value"] is not None:
+                    variables[var["name"]] = var["value"]
+
+    assert ("x" + new_filename).startswith(variables["a"])
+    assert new_filename.startswith(variables["b"])
+
+
+# Edge case tests
+@with_session(SESSION_ID)
+def test_read_code_without_saved_file(client: TestClient) -> None:
+    """Test read_code when file hasn't been saved yet."""
+    from marimo._utils.http import HTTPStatus
+
+    # Mock the session to have no file path
+    with patch("marimo._server.api.endpoints.files.AppState") as mock_state:
+        mock_session = Mock()
+        mock_session.app_file_manager.path = None
+        mock_state.return_value.require_current_session.return_value = (
+            mock_session
+        )
+
+        response = client.post(
+            "/api/kernel/read_code",
+            headers=HEADERS,
+            json={},
+        )
+
+        assert response.status_code == HTTPStatus.BAD_REQUEST
+        assert (
+            "File must be saved before downloading"
+            in response.json()["detail"]
+        )
+
+
+def test_endpoints_without_authentication(client: TestClient) -> None:
+    """Test endpoints without proper authentication headers."""
+    endpoints_and_methods = [
+        ("/api/kernel/read_code", "post"),
+        ("/api/kernel/rename", "post"),
+        ("/api/kernel/save", "post"),
+        ("/api/kernel/copy", "post"),
+        ("/api/kernel/save_app_config", "post"),
+    ]
+
+    for endpoint, method in endpoints_and_methods:
+        response = getattr(client, method)(
+            endpoint,
+            json={"test": "data"},
+        )
+        # Should require authentication
+        assert response.status_code in [401, 403, 422]
+
+
+@pytest.mark.skipif(
+    is_windows(), reason="Windows doesn't support these edge case filenames"
+)
+@with_session(SESSION_ID)
+def test_rename_with_edge_case_filenames(client: TestClient) -> None:
+    """Test rename endpoint with unicode and spaces in filenames."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for filename in EDGE_CASE_FILENAMES:
+            current_filename = get_session_manager(
+                client
+            ).workspace.get_unique_file_key()
+            assert current_filename
+
+            new_path = Path(tmpdir) / filename
+            response = client.post(
+                "/api/kernel/rename",
+                headers=HEADERS,
+                json={
+                    "filename": str(new_path),
+                },
+            )
+            assert response.json() == {"success": True}
+
+            def _new_path_exists():
+                assert new_path.exists()  # noqa: B023
+                # Ensure content is preserved and readable
+                content = new_path.read_text(encoding="utf-8")  # noqa: B023
+                assert "import marimo" in content
+
+            try_assert_n_times(5, _new_path_exists)

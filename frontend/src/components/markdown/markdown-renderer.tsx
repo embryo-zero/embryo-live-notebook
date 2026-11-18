@@ -1,0 +1,234 @@
+/* Copyright 2026 Marimo. All rights reserved. */
+
+import { EditorView } from "@codemirror/view";
+import { useAtomValue } from "jotai";
+import { createContext, memo, Suspense, useContext, useState } from "react";
+import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
+import {
+  defaultRehypePlugins,
+  Streamdown,
+  type StreamdownProps,
+} from "streamdown";
+import { Button, type ButtonProps } from "@/components/ui/button";
+import { maybeAddMarimoImport } from "@/core/cells/add-missing-import";
+import { useCellActions } from "@/core/cells/actions";
+import { useLastFocusedCellId } from "@/core/cells/focus";
+import { MarkdownLanguageAdapter } from "@/core/codemirror/language/languages/markdown";
+import { SQLLanguageAdapter } from "@/core/codemirror/language/languages/sql/sql";
+import { autoInstantiateAtom } from "@/core/config/config";
+import { useAsyncData } from "@/hooks/useAsyncData";
+import { LazyAnyLanguageCodeMirror } from "@/plugins/impl/code/LazyAnyLanguageCodeMirror";
+import { useTheme } from "@/theme/useTheme";
+import { copyToClipboard } from "@/utils/copy";
+import "./markdown-renderer.css";
+
+const extensions = [EditorView.lineWrapping];
+
+const NotebookInsertionContext = createContext(true);
+
+interface CodeBlockProps {
+  code: string;
+  language: string | undefined;
+}
+
+function maybeTransform(
+  language: string | undefined,
+  code: string,
+): {
+  language: string;
+  code: string;
+} {
+  // Default to python
+  if (!language) {
+    return { language: "python", code };
+  }
+  // Already in the right language
+  if (language === "python") {
+    return { language, code };
+  }
+  // Convert to python
+  if (language === "sql") {
+    return { language: "python", code: SQLLanguageAdapter.fromQuery(code) };
+  }
+  // Convert to python
+  if (language === "markdown") {
+    return {
+      language: "python",
+      code: MarkdownLanguageAdapter.fromMarkdown(code),
+    };
+  }
+  // Run shell commands
+  if (language === "shell" || language === "bash") {
+    return {
+      language: "python",
+      code: `import subprocess\nsubprocess.run("${code}")`,
+    };
+  }
+  // Store as a string
+  return {
+    language: "python",
+    code: `_${language} = """\n${code}\n"""`,
+  };
+}
+
+const InsertCodeBlockButton = ({ code, language }: CodeBlockProps) => {
+  const { createCell } = useCellActions();
+  const lastFocusedCellId = useLastFocusedCellId();
+  const autoInstantiate = useAtomValue(autoInstantiateAtom);
+
+  const handleInsertCode = () => {
+    const result = maybeTransform(language, code);
+
+    if (language === "sql") {
+      maybeAddMarimoImport({
+        autoInstantiate,
+        createCell,
+        fromCellId: lastFocusedCellId,
+      });
+    }
+    createCell({ after: lastFocusedCellId, code: result.code });
+  };
+
+  return (
+    <Button size="xs" variant="outline" onClick={handleInsertCode}>
+      Add to Notebook
+    </Button>
+  );
+};
+
+const CodeBlock = ({ code, language }: CodeBlockProps) => {
+  const { theme } = useTheme();
+  const allowNotebookInsertion = useContext(NotebookInsertionContext);
+  const [value, setValue] = useState(code);
+
+  if (value !== code) {
+    setValue(code);
+  }
+
+  const handleCopyCode = async () => {
+    await copyToClipboard(value);
+  };
+
+  return (
+    <div className="relative">
+      <Suspense>
+        <LazyAnyLanguageCodeMirror
+          theme={theme === "dark" ? "dark" : "light"}
+          language={language}
+          // Since this may be LLM generated, we don't want show errors for unsupported languages
+          hideUnsupportedLanguageErrors={true}
+          className="cm border rounded overflow-hidden"
+          extensions={extensions}
+          value={value}
+          onChange={setValue}
+        />
+      </Suspense>
+      <div className="flex justify-end mt-3 gap-2">
+        <CopyButton size="xs" variant="outline" onClick={handleCopyCode}>
+          Copy
+        </CopyButton>
+        {allowNotebookInsertion && (
+          <InsertCodeBlockButton code={value} language={language} />
+        )}
+      </div>
+    </div>
+  );
+};
+
+const CopyButton: React.FC<ButtonProps> = ({ onClick, ...props }) => {
+  const [copied, setCopied] = useState(false);
+
+  return (
+    <Button
+      {...props}
+      onClick={(e) => {
+        onClick?.(e);
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1000);
+      }}
+    >
+      {copied ? "Copied" : "Copy"}
+    </Button>
+  );
+};
+
+// Allow `className` on every element; the default GitHub schema strips it,
+// which drops the styling on marimo HTML like `mo.md(...)` admonitions.
+const sanitizeSchema = {
+  ...defaultSchema,
+  attributes: {
+    ...defaultSchema.attributes,
+    "*": [...(defaultSchema.attributes?.["*"] ?? []), "className"],
+  },
+  protocols: {
+    ...defaultSchema.protocols,
+    href: [...(defaultSchema.protocols?.href ?? []), "zotero"],
+  },
+};
+
+// Keep Streamdown's other rehype plugins (raw, harden) so scripts and unsafe
+// URLs are still sanitized.
+const REHYPE_PLUGINS: StreamdownProps["rehypePlugins"] = Object.values({
+  ...defaultRehypePlugins,
+  sanitize: [rehypeSanitize, sanitizeSchema],
+});
+
+type Components = StreamdownProps["components"];
+
+const COMPONENTS: Components = {
+  code: ({ children, className }) => {
+    const language = className?.replace("language-", "");
+    if (language && typeof children === "string") {
+      const code = children.trim();
+      return (
+        <div className="my-4">
+          <div className="mb-1 text-xs text-muted-foreground pl-1">
+            {language}
+          </div>
+          <CodeBlock code={code} language={language} />
+        </div>
+      );
+    }
+    return <code className={className}>{children}</code>;
+  },
+};
+
+// Lazy-load the math plugin to keep katex (~264 KB) out of the critical path.
+// The first render works without math; once loaded, it re-renders with math support.
+let mathPluginCache: StreamdownProps["plugins"] | undefined;
+const useMathPlugin = () => {
+  const { data: plugins } = useAsyncData(async () => {
+    if (mathPluginCache) {
+      return mathPluginCache;
+    }
+    const mod = await import("@streamdown/math");
+    mathPluginCache = { math: mod.math };
+    return mathPluginCache;
+  }, []);
+  return plugins;
+};
+
+export const MarkdownRenderer = memo(
+  ({
+    content,
+    allowNotebookInsertion = true,
+  }: {
+    content: string;
+    allowNotebookInsertion?: boolean;
+  }) => {
+    const plugins = useMathPlugin();
+    return (
+      <NotebookInsertionContext.Provider value={allowNotebookInsertion}>
+        <Streamdown
+          components={COMPONENTS}
+          plugins={plugins}
+          rehypePlugins={REHYPE_PLUGINS}
+          className="mo-markdown-renderer"
+        >
+          {content}
+        </Streamdown>
+      </NotebookInsertionContext.Provider>
+    );
+  },
+);
+MarkdownRenderer.displayName = "MarkdownRenderer";

@@ -1,0 +1,788 @@
+/* Copyright 2026 Marimo. All rights reserved. */
+
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { Mocks } from "@/__mocks__/common";
+import { cellId } from "@/__tests__/branded";
+import { CellOutputId } from "@/core/cells/ids";
+import {
+  downloadAsPDF,
+  downloadByURL,
+  downloadCellOutputAsImage,
+  downloadExportedFile,
+  downloadHTMLAsImage,
+  getImageDataUrlForCell,
+  isDownloadUrl,
+  withLoadingToast,
+} from "../download";
+
+const { mockExportAsPDF } = vi.hoisted(() => ({
+  mockExportAsPDF: vi.fn(),
+}));
+
+// Mock html-to-image
+vi.mock("html-to-image", () => ({
+  toPng: vi.fn(),
+}));
+
+vi.mock("@/core/network/requests", () => ({
+  getRequestClient: () => ({
+    exportAsPDF: mockExportAsPDF,
+  }),
+}));
+
+// Mock the toast module
+const { mockDismiss, mockUpdate, toastMock } = vi.hoisted(() => {
+  const dismiss = vi.fn();
+  const update = vi.fn();
+  return {
+    mockDismiss: dismiss,
+    mockUpdate: update,
+    toastMock: { toast: vi.fn(() => ({ dismiss, update })) },
+  };
+});
+vi.mock("@/components/ui/use-toast", () => toastMock);
+
+// Mock the Spinner component
+vi.mock("@/components/icons/spinner", () => ({
+  Spinner: () => "MockSpinner",
+}));
+
+vi.mock("@/utils/Logger", () => ({ Logger: Mocks.quietLogger() }));
+
+// Mock Filenames
+vi.mock("@/utils/filenames", () => ({
+  Filenames: {
+    toPNG: (name: string) => `${name}.png`,
+    toPDF: (name: string) => `${name}.pdf`,
+  },
+}));
+
+import { toPng } from "html-to-image";
+import { toast } from "@/components/ui/use-toast";
+import { Logger } from "@/utils/Logger";
+
+describe("withLoadingToast", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("should show a loading toast and dismiss on success", async () => {
+    const result = await withLoadingToast("Loading...", async () => {
+      return "success";
+    });
+
+    expect(toast).toHaveBeenCalledTimes(1);
+    expect(toast).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: "Loading...",
+        duration: Infinity,
+      }),
+    );
+    expect(mockDismiss).toHaveBeenCalledTimes(1);
+    expect(result).toBe("success");
+  });
+
+  it("should dismiss toast and rethrow on error", async () => {
+    const error = new Error("Operation failed");
+
+    await expect(
+      withLoadingToast("Loading...", async () => {
+        throw error;
+      }),
+    ).rejects.toThrow("Operation failed");
+
+    expect(toast).toHaveBeenCalledTimes(1);
+    expect(mockDismiss).toHaveBeenCalledTimes(1);
+  });
+
+  it("should return the value from the async function", async () => {
+    const expectedValue = { data: "test", count: 42 };
+
+    const result = await withLoadingToast("Processing...", async () => {
+      return expectedValue;
+    });
+
+    expect(result).toEqual(expectedValue);
+  });
+
+  it("should handle void functions", async () => {
+    let sideEffect = false;
+
+    await withLoadingToast("Saving...", async () => {
+      sideEffect = true;
+    });
+
+    expect(sideEffect).toBe(true);
+    expect(mockDismiss).toHaveBeenCalledTimes(1);
+  });
+
+  it("should use the provided title in the toast", async () => {
+    const customTitle = "Downloading PDF...";
+
+    await withLoadingToast(customTitle, async () => "done");
+
+    expect(toast).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: customTitle,
+      }),
+    );
+  });
+
+  it("should update toast on finish when onFinish is provided", async () => {
+    await withLoadingToast("Uploading files...", async () => "done", {
+      title: "Upload complete",
+    });
+
+    expect(toast).toHaveBeenCalledTimes(1);
+    expect(mockUpdate).toHaveBeenCalledTimes(1);
+    expect(mockUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: "Upload complete",
+        description: undefined,
+        duration: 1200,
+      }),
+    );
+    expect(mockDismiss).not.toHaveBeenCalled();
+  });
+
+  it("should allow onFinish to override duration", async () => {
+    await withLoadingToast("Uploading files...", async () => "done", {
+      title: "Upload complete",
+      duration: 2000,
+    });
+
+    expect(mockUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        duration: 2000,
+      }),
+    );
+  });
+
+  it("should not update toast when the operation fails", async () => {
+    await expect(
+      withLoadingToast(
+        "Uploading files...",
+        async () => {
+          throw new Error("Upload failed");
+        },
+        { title: "Upload complete" },
+      ),
+    ).rejects.toThrow("Upload failed");
+
+    expect(toast).toHaveBeenCalledTimes(1);
+    expect(mockUpdate).not.toHaveBeenCalled();
+  });
+
+  it("should wait for the async function to complete", async () => {
+    const events: string[] = [];
+
+    await withLoadingToast("Loading...", async () => {
+      events.push("start");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      events.push("end");
+    });
+
+    expect(events).toEqual(["start", "end"]);
+    expect(mockDismiss).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("downloadAsPDF", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("should send the preset in export request payload", async () => {
+    mockExportAsPDF.mockRejectedValue(new Error("network"));
+
+    await expect(
+      downloadAsPDF({
+        webpdf: false,
+        preset: "slides",
+      }),
+    ).rejects.toThrow("network");
+
+    expect(mockExportAsPDF).toHaveBeenCalledWith({
+      webpdf: false,
+      preset: "slides",
+      includeInputs: true,
+      includeOutputs: true,
+    });
+  });
+
+  it("should send input and output selections", async () => {
+    mockExportAsPDF.mockRejectedValue(new Error("network"));
+
+    await expect(
+      downloadAsPDF({
+        webpdf: true,
+        includeInputs: false,
+        includeOutputs: false,
+      }),
+    ).rejects.toThrow("network");
+
+    expect(mockExportAsPDF).toHaveBeenCalledWith({
+      webpdf: true,
+      preset: "document",
+      includeInputs: false,
+      includeOutputs: false,
+    });
+  });
+});
+
+describe("getImageDataUrlForCell", () => {
+  const mockDataUrl = "data:image/png;base64,mockbase64data";
+  let mockElement: HTMLElement;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockElement = document.createElement("div");
+    mockElement.id = CellOutputId.create(cellId("cell-1"));
+    document.body.append(mockElement);
+  });
+
+  afterEach(() => {
+    mockElement.remove();
+  });
+
+  it("should return undefined if element is not found", async () => {
+    const result = await getImageDataUrlForCell(cellId("nonexistent"));
+
+    expect(result).toBeUndefined();
+    expect(Logger.error).toHaveBeenCalledWith(
+      "Output element not found for cell nonexistent",
+    );
+  });
+
+  it("should capture screenshot and return data URL", async () => {
+    vi.mocked(toPng).mockResolvedValue(mockDataUrl);
+
+    const result = await getImageDataUrlForCell(cellId("cell-1"));
+
+    expect(result).toBe(mockDataUrl);
+    expect(toPng).toHaveBeenCalledWith(
+      mockElement,
+      expect.objectContaining({
+        filter: expect.any(Function),
+        onImageErrorHandler: expect.any(Function),
+      }),
+    );
+  });
+
+  it("should pass style options to prevent clipping", async () => {
+    vi.mocked(toPng).mockResolvedValue(mockDataUrl);
+
+    await getImageDataUrlForCell(cellId("cell-1"));
+
+    expect(toPng).toHaveBeenCalledWith(
+      mockElement,
+      expect.objectContaining({
+        style: {
+          maxHeight: "none",
+          overflow: "visible",
+        },
+      }),
+    );
+  });
+
+  it("should pass scrollHeight as height option", async () => {
+    // Set up element with scrollHeight
+    Object.defineProperty(mockElement, "scrollHeight", {
+      value: 500,
+      configurable: true,
+    });
+    vi.mocked(toPng).mockResolvedValue(mockDataUrl);
+
+    await getImageDataUrlForCell(cellId("cell-1"));
+
+    expect(toPng).toHaveBeenCalledWith(
+      mockElement,
+      expect.objectContaining({
+        height: 500,
+      }),
+    );
+  });
+
+  it("should pass scrollbar hiding styles via extraStyleContent", async () => {
+    vi.mocked(toPng).mockResolvedValue(mockDataUrl);
+
+    await getImageDataUrlForCell(cellId("cell-1"));
+
+    expect(toPng).toHaveBeenCalledWith(
+      mockElement,
+      expect.objectContaining({
+        extraStyleContent: expect.stringContaining("scrollbar-width: none"),
+      }),
+    );
+  });
+
+  it("should not modify the live DOM element", async () => {
+    mockElement.style.overflow = "hidden";
+    mockElement.style.maxHeight = "100px";
+    vi.mocked(toPng).mockResolvedValue(mockDataUrl);
+
+    await getImageDataUrlForCell(cellId("cell-1"));
+
+    // DOM should remain unchanged
+    expect(mockElement.style.overflow).toBe("hidden");
+    expect(mockElement.style.maxHeight).toBe("100px");
+  });
+
+  it("should throw error on failure", async () => {
+    vi.mocked(toPng).mockRejectedValue(new Error("Capture failed"));
+
+    await expect(getImageDataUrlForCell(cellId("cell-1"))).rejects.toThrow(
+      "Capture failed",
+    );
+  });
+
+  it("should handle concurrent captures correctly", async () => {
+    // Create a second element
+    const mockElement2 = document.createElement("div");
+    mockElement2.id = CellOutputId.create(cellId("cell-2"));
+    document.body.append(mockElement2);
+
+    vi.mocked(toPng).mockResolvedValue(mockDataUrl);
+
+    const capture1 = getImageDataUrlForCell(cellId("cell-1"));
+    const capture2 = getImageDataUrlForCell(cellId("cell-2"));
+
+    await Promise.all([capture1, capture2]);
+
+    expect(toPng).toHaveBeenCalledTimes(2);
+
+    mockElement2.remove();
+  });
+});
+
+describe("downloadHTMLAsImage", () => {
+  const mockDataUrl = "data:image/png;base64,mockbase64data";
+  let mockElement: HTMLElement;
+  let mockAppEl: HTMLElement;
+  let mockAnchor: HTMLAnchorElement;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockElement = document.createElement("div");
+    mockAppEl = document.createElement("div");
+    mockAppEl.id = "App";
+    // Mock scrollTo since jsdom doesn't implement it
+    mockAppEl.scrollTo = vi.fn();
+    document.body.append(mockElement);
+    document.body.append(mockAppEl);
+
+    // Mock anchor element for download
+    mockAnchor = document.createElement("a");
+    vi.spyOn(document, "createElement").mockReturnValue(mockAnchor);
+    vi.spyOn(mockAnchor, "click").mockImplementation(() => {
+      // <noop></noop>
+    });
+    vi.spyOn(mockAnchor, "remove").mockImplementation(() => {
+      // noop
+    });
+  });
+
+  afterEach(() => {
+    mockElement.remove();
+    mockAppEl.remove();
+    vi.restoreAllMocks();
+  });
+
+  it("should download image without prepare function", async () => {
+    vi.mocked(toPng).mockResolvedValue(mockDataUrl);
+
+    expect(
+      await downloadHTMLAsImage({ element: mockElement, filename: "test" }),
+    ).toBe(true);
+    expect(toPng).toHaveBeenCalledWith(
+      mockElement,
+      expect.objectContaining({
+        filter: expect.any(Function),
+        onImageErrorHandler: expect.any(Function),
+      }),
+    );
+    expect(mockAnchor.href).toBe(mockDataUrl);
+    expect(mockAnchor.download).toBe("test.png");
+    expect(mockAnchor.click).toHaveBeenCalled();
+  });
+
+  it("should use prepare function when provided", async () => {
+    vi.mocked(toPng).mockResolvedValue(mockDataUrl);
+    const cleanup = vi.fn();
+    const prepare = vi.fn().mockReturnValue(cleanup);
+
+    await downloadHTMLAsImage({
+      element: mockElement,
+      filename: "test",
+      prepare,
+    });
+
+    expect(prepare).toHaveBeenCalledWith(mockElement);
+    expect(cleanup).toHaveBeenCalled();
+  });
+
+  it("should delegate body.printing management to prepare function", async () => {
+    let bodyPrintingDuringCapture = false;
+    vi.mocked(toPng).mockImplementation(async () => {
+      // Capture the state during toPng execution
+      bodyPrintingDuringCapture = document.body.classList.contains("printing");
+      return mockDataUrl;
+    });
+    const cleanup = vi.fn();
+    // Mock prepare that adds body.printing
+    const prepare = vi.fn().mockImplementation(() => {
+      document.body.classList.add("printing");
+      return () => {
+        document.body.classList.remove("printing");
+        cleanup();
+      };
+    });
+
+    await downloadHTMLAsImage({
+      element: mockElement,
+      filename: "test",
+      prepare,
+    });
+
+    // body.printing should be added by prepare function
+    expect(bodyPrintingDuringCapture).toBe(true);
+    expect(document.body.classList.contains("printing")).toBe(false);
+    expect(prepare).toHaveBeenCalledWith(mockElement);
+    expect(cleanup).toHaveBeenCalled();
+  });
+
+  it("should show error toast on failure", async () => {
+    vi.mocked(toPng).mockRejectedValue(new Error("Failed"));
+
+    expect(
+      await downloadHTMLAsImage({ element: mockElement, filename: "test" }),
+    ).toBe(false);
+    expect(toast).toHaveBeenCalledWith({
+      title: "Failed to download as PNG",
+      description: "Failed",
+      variant: "danger",
+    });
+  });
+
+  it("should cleanup on failure", async () => {
+    vi.mocked(toPng).mockRejectedValue(new Error("Failed"));
+
+    await downloadHTMLAsImage({ element: mockElement, filename: "test" });
+
+    expect(document.body.classList.contains("printing")).toBe(false);
+  });
+});
+
+describe("downloadCellOutputAsImage", () => {
+  const mockDataUrl = "data:image/png;base64,mockbase64data";
+  let mockElement: HTMLElement;
+  let mockAppEl: HTMLElement;
+  let mockAnchor: HTMLAnchorElement;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockElement = document.createElement("div");
+    mockElement.id = CellOutputId.create(cellId("cell-1"));
+    mockAppEl = document.createElement("div");
+    mockAppEl.id = "App";
+    // Mock scrollTo since jsdom doesn't implement it
+    mockAppEl.scrollTo = vi.fn();
+    document.body.append(mockElement);
+    document.body.append(mockAppEl);
+
+    mockAnchor = document.createElement("a");
+    vi.spyOn(document, "createElement").mockReturnValue(mockAnchor);
+    vi.spyOn(mockAnchor, "click").mockImplementation(() => {
+      // <noop></noop>
+    });
+    vi.spyOn(mockAnchor, "remove").mockImplementation(() => {
+      // <noop></noop>
+    });
+  });
+
+  afterEach(() => {
+    mockElement.remove();
+    mockAppEl.remove();
+    vi.restoreAllMocks();
+  });
+
+  it("should show error toast if element not found", async () => {
+    await downloadCellOutputAsImage(cellId("nonexistent"), "test");
+
+    expect(toPng).not.toHaveBeenCalled();
+    expect(Logger.error).toHaveBeenCalledWith(
+      "Output element not found for cell nonexistent",
+    );
+    expect(toast).toHaveBeenCalledWith({
+      title: "Failed to download PNG",
+      description: expect.any(String),
+      variant: "danger",
+    });
+  });
+
+  it("should show error toast if toPng fails", async () => {
+    vi.mocked(toPng).mockRejectedValue(new Error("Screenshot failed"));
+
+    await downloadCellOutputAsImage(cellId("cell-1"), "result");
+
+    expect(toast).toHaveBeenCalledWith({
+      title: "Failed to download PNG",
+      description: expect.stringContaining("Screenshot failed"),
+      variant: "danger",
+    });
+  });
+
+  it("should download cell output as image", async () => {
+    vi.mocked(toPng).mockResolvedValue(mockDataUrl);
+
+    await downloadCellOutputAsImage(cellId("cell-1"), "result");
+
+    expect(toPng).toHaveBeenCalledWith(
+      mockElement,
+      expect.objectContaining({
+        filter: expect.any(Function),
+        onImageErrorHandler: expect.any(Function),
+      }),
+    );
+    expect(mockAnchor.download).toBe("result.png");
+  });
+
+  it("should pass style options to toPng for full content capture", async () => {
+    vi.mocked(toPng).mockResolvedValue(mockDataUrl);
+
+    await downloadCellOutputAsImage(cellId("cell-1"), "result");
+
+    expect(toPng).toHaveBeenCalledWith(
+      mockElement,
+      expect.objectContaining({
+        style: {
+          maxHeight: "none",
+          overflow: "visible",
+        },
+      }),
+    );
+  });
+
+  it("should not modify the live DOM element", async () => {
+    mockElement.style.overflow = "hidden";
+    mockElement.style.maxHeight = "100px";
+    vi.mocked(toPng).mockResolvedValue(mockDataUrl);
+
+    await downloadCellOutputAsImage(cellId("cell-1"), "result");
+
+    // DOM should remain unchanged
+    expect(mockElement.style.overflow).toBe("hidden");
+    expect(mockElement.style.maxHeight).toBe("100px");
+  });
+});
+
+describe("downloadByURL", () => {
+  let mockAnchor: HTMLAnchorElement;
+
+  beforeEach(() => {
+    mockAnchor = document.createElement("a");
+    vi.spyOn(document, "createElement").mockReturnValue(mockAnchor);
+    vi.spyOn(mockAnchor, "click").mockImplementation(() => {
+      // <noop></noop>
+    });
+    vi.spyOn(mockAnchor, "remove").mockImplementation(() => {
+      // <noop></noop>
+    });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it("should create anchor, set attributes, click, and remove", () => {
+    downloadByURL("data:image/png;base64,AAA=", "filename.png");
+
+    expect(document.createElement).toHaveBeenCalledWith("a");
+    expect(mockAnchor.href).toBe("data:image/png;base64,AAA=");
+    expect(mockAnchor.download).toBe("filename.png");
+    expect(mockAnchor.click).toHaveBeenCalled();
+    expect(mockAnchor.remove).toHaveBeenCalled();
+  });
+
+  it.each([
+    "https://example.com/results.csv",
+    "http://example.com/results.csv",
+    "//example.com/results.csv",
+    "./@file/123-results.csv",
+    "/files/results.csv?download=1#data",
+    "../results.csv",
+    "blob:http://localhost/123",
+    "data:text/csv;charset=utf-8,a%2Cb",
+    "DATA:TEXT/PLAIN;base64,aGVsbG8=",
+    "data:application/json,%7B%7D",
+    "data:application/octet-stream;base64,AAA=",
+    "data:audio/x-wav;base64,AAA=",
+    "data:AUDIO/MPEG;codecs=mp3;base64,AAA=",
+    "data:video/mp4;base64,AAA=",
+    "data:image/tiff;base64,AAA=",
+    "data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,AAA=",
+    "data:application/vnd.ms-excel;base64,AAA=",
+    "data:application/vnd.apache.parquet;base64,AAA=",
+    "data:application/x-hdf5;base64,AAA=",
+    "data:application/x-custom-format;base64,AAA=",
+    "data:application/geo+json,%7B%7D",
+    "data:application/epub+zip;base64,AAA=",
+    "data:font/woff2;base64,AAA=",
+    "data:text/markdown;charset=utf-8,%23%20Title",
+    "data:application/pdf;base64,AAA=",
+    "data:,hello",
+    "data:;base64,aGVsbG8=",
+    "data:text/plain,",
+    "data:text/plain,javascript:alert(1)",
+    "data:text/plain,hello?name=world#fragment",
+    "data:application/javascript-source,source%20code",
+    " https://example.com/results.csv ",
+  ])("downloads %s without an explicit filename", (url) => {
+    downloadByURL(url);
+
+    expect(mockAnchor.getAttribute("href")).toBe(url);
+    expect(mockAnchor.getAttribute("download")).toBe("");
+    expect(mockAnchor.click).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    "javascript:alert(1)",
+    "JaVaScRiPt:alert(1)",
+    " \u0000javascript:alert(1)",
+    "java\tscript:alert(1)",
+    "java\nscript:alert(1)",
+    "java\rscript:alert(1)",
+    "vbscript:msgbox(1)",
+    "file:///tmp/results.csv",
+    "ftp://example.com/results.csv",
+    "mailto:example@example.com",
+    "data:text/html,<h1>hello</h1>",
+    "data:TEXT/HTML;charset=utf-8;base64,AAA=",
+    "data:image/svg+xml,<svg/>",
+    "data:application/xhtml+xml,<html/>",
+    "data:text/javascript,alert(1)",
+    "data:application/javascript;charset=utf-8,alert(1)",
+    "data:application/x-javascript;base64,AAA=",
+    "data:application/ecmascript,alert(1)",
+    "data:application/x-ecmascript,alert(1)",
+    "data:text/ecmascript,alert(1)",
+    "data:text/x-ecmascript,alert(1)",
+    "data:text/x-javascript,alert(1)",
+    "data:text/javascript1.0,alert(1)",
+    "data:text/javascript1.1,alert(1)",
+    "data:text/javascript1.2,alert(1)",
+    "data:text/javascript1.3,alert(1)",
+    "data:text/javascript1.4,alert(1)",
+    "data:text/javascript1.5,alert(1)",
+    "data:text/jscript,alert(1)",
+    "data:text/livescript,alert(1)",
+    "data:text/vbscript,msgbox(1)",
+    "data:text/xml,<root/>",
+    "data:application/xml,<root/>",
+    "data:IMAGE/SVG+XML;charset=utf-8;base64,AAA=",
+    "data:application/custom+xml,<root/>",
+    "data:invalid,hello",
+    "data:text/,hello",
+    "data:/plain,hello",
+    "data:text/pl ain,hello",
+    "data:text/plain/extra,hello",
+    "data:text/plain",
+    "https://[invalid",
+    "",
+    " \n\t",
+  ])("rejects %j before creating a download link", (url) => {
+    expect(() => downloadByURL(url)).toThrow("Unsupported download URL");
+    expect(document.createElement).not.toHaveBeenCalled();
+    expect(mockAnchor.click).not.toHaveBeenCalled();
+  });
+
+  it.each(Array.from({ length: 33 }, (_, code) => code))(
+    "rejects a script scheme with leading ASCII character %i",
+    (code) => {
+      const url = `${String.fromCharCode(code)}JaVa\nScRi\tPt:alert(1)`;
+      expect(() => downloadByURL(url)).toThrow("Unsupported download URL");
+      expect(document.createElement).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    "text/html",
+    "application/xhtml+xml",
+    "image/svg+xml",
+    "application/custom+xml",
+    "text/javascript1.4",
+    "text/javascript2.0",
+    "application/x-javascript2.0",
+    "text/ecmascript2026",
+    "text/livescript",
+  ])("rejects normalized and parameterized data MIME type %s", (mimeType) => {
+    const urls = [
+      `DATA:${mimeType.toUpperCase()},payload`,
+      `data: ${mimeType} ;charset=utf-8,payload`,
+      `data:${mimeType};charset="utf-8";base64,cGF5bG9hZA==`,
+      `da\tta:${mimeType};name=file.txt,payload?query#fragment`,
+    ];
+    for (const url of urls) {
+      expect(() => downloadByURL(url)).toThrow("Unsupported download URL");
+    }
+    expect(document.createElement).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    null,
+    undefined,
+    42,
+    false,
+    {},
+    [],
+    new String("https://example.com"),
+  ])("rejects non-string input %j without throwing or coercing it", (url) => {
+    expect(isDownloadUrl(url)).toBe(false);
+  });
+
+  it.each([false, true])(
+    "releases exported files after a click (fails=%s)",
+    async (fails) => {
+      let downloadedBlob: Blob | undefined;
+      vi.stubGlobal(
+        "URL",
+        class extends URL {
+          public static override createObjectURL = vi.fn((blob: Blob) => {
+            downloadedBlob = blob;
+            return "blob:export";
+          });
+          public static override revokeObjectURL = vi.fn();
+        },
+      );
+
+      if (fails) {
+        vi.mocked(mockAnchor.click).mockImplementation(() => {
+          throw new Error("Download failed");
+        });
+      }
+      const download = () =>
+        downloadExportedFile({
+          contents: "notebook",
+          filename: "résumé.qmd",
+          mediaType: "text/plain; charset=utf-8",
+        });
+      let caughtError: unknown;
+      try {
+        download();
+      } catch (error) {
+        caughtError = error;
+      }
+
+      expect(caughtError).toEqual(
+        fails ? new Error("Download failed") : undefined,
+      );
+
+      expect(downloadedBlob?.type).toBe("text/plain; charset=utf-8");
+      expect(await downloadedBlob?.text()).toBe("notebook");
+      expect(mockAnchor.download).toBe("résumé.qmd");
+      expect(mockAnchor.remove).toHaveBeenCalledOnce();
+      expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:export");
+    },
+  );
+});

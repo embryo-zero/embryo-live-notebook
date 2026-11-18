@@ -1,0 +1,77 @@
+/* Copyright 2026 Marimo. All rights reserved. */
+import { atom } from "jotai";
+import { atomWithReducer } from "jotai/utils";
+import type { NotificationMessageData } from "../kernel/messages";
+import { isNotebookPage } from "../mode";
+import { waitFor } from "../state/jotai";
+import { type ConnectionStatus, ConnectionState } from "../session/types";
+
+/**
+ * Shared application state, not the actual event-stream status.
+ *
+ * TODO(MO-8051) Expose read-only connection state and derive UI availability
+ * separately.
+ */
+export const connectionAtom = atom<ConnectionStatus>({
+  state: ConnectionState.NOT_STARTED,
+});
+
+type StartupProgress = NotificationMessageData<"startup-progress">;
+
+export const startupProgressAtom = atomWithReducer<
+  Pick<StartupProgress, "phase" | "logs"> | null,
+  StartupProgress | null
+>(null, (previous, update: StartupProgress | null) =>
+  update === null
+    ? null
+    : {
+        phase: update.phase,
+        logs:
+          update.log_mode === "append" && previous?.phase === update.phase
+            ? previous.logs + update.logs
+            : update.logs,
+      },
+);
+
+export function waitForConnectionOpen() {
+  return waitFor(connectionAtom, (value) => {
+    return value.state === ConnectionState.OPEN;
+  });
+}
+
+/**
+ * Waits for the kernel connection, but only on pages that open one. Non-notebook
+ * pages (home, gallery) never connect, so waiting there would hang forever.
+ *
+ * Use for requests that the marimo server can serve without a session, but that
+ * should still wait for the kernel when a notebook is open.
+ */
+export function waitForConnectionOpenIfNotebook() {
+  if (!isNotebookPage()) {
+    return Promise.resolve();
+  }
+  return waitForConnectionOpen();
+}
+
+export const isConnectingAtom = atom((get) => {
+  const connection = get(connectionAtom);
+  return connection.state === ConnectionState.CONNECTING;
+});
+
+export const isConnectedAtom = atom((get) => {
+  const connection = get(connectionAtom);
+  return connection.state === ConnectionState.OPEN;
+});
+
+export const canInteractWithAppAtom = atom((get) => {
+  const connection = get(connectionAtom);
+  return (
+    connection.state === ConnectionState.OPEN ||
+    connection.state === ConnectionState.NOT_STARTED
+  );
+});
+
+export const isClosedAtom = atom((get) => {
+  const connection = get(connectionAtom);
+  return connection.state === ConnectionState.CLOSED;
+});

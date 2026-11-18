@@ -1,0 +1,821 @@
+# Copyright 2026 Marimo. All rights reserved.
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Literal
+
+from starlette.authentication import requires
+from starlette.exceptions import HTTPException
+from starlette.responses import (
+    PlainTextResponse,
+    Response,
+    StreamingResponse,
+)
+
+from marimo import _loggers
+from marimo._ai._pydantic_ai_utils import create_simple_prompt, generate_id
+from marimo._cli.install_hints import get_install_hint
+from marimo._config.config_schema import AiConfig, MarimoConfig
+from marimo._config.types import CopilotMode
+from marimo._secrets.secrets import get_secret_value
+from marimo._server.ai.config import (
+    AnyProviderConfig,
+    get_autocomplete_model,
+    get_chat_model,
+    get_edit_model,
+    get_max_tokens,
+)
+from marimo._server.ai.mcp import MCPServerStatus, get_mcp_client
+from marimo._server.ai.prompts import (
+    FIM_MIDDLE_TAG,
+    FIM_PREFIX_TAG,
+    FIM_SUFFIX_TAG,
+    get_chat_system_prompt,
+    get_inline_system_prompt,
+    get_refactor_or_insert_notebook_cell_system_prompt,
+)
+from marimo._server.ai.providers import (
+    StreamOptions,
+    get_completion_provider,
+)
+from marimo._server.ai.tools.tool_manager import get_tool_manager
+from marimo._server.ai.tracing import SpanInfo
+from marimo._server.api.deps import AppState
+from marimo._server.api.utils import parse_request
+from marimo._server.models.completion import (
+    AiCompletionRequest,
+    AiInlineCompletionRequest,
+    ChatRequest,
+    UIMessage,
+)
+from marimo._server.models.models import (
+    InvokeAiToolRequest,
+    InvokeAiToolResponse,
+    MCPRefreshResponse,
+    MCPStatusResponse,
+    ProviderModel,
+    ProviderModelsResponse,
+)
+from marimo._server.responses import StructResponse
+from marimo._server.router import APIRouter
+from marimo._utils.http import HTTPStatus
+
+if TYPE_CHECKING:
+    from http.client import HTTPMessage
+    from typing import IO
+
+    from starlette.requests import Request
+
+# Taken from pydantic_ai.ui import SSE_CONTENT_TYPE
+SSE_CONTENT_TYPE = "text/event-stream"
+
+
+LOGGER = _loggers.marimo_logger()
+
+# Router for file ai
+router = APIRouter()
+
+
+def _missing_mcp_dependencies_message() -> str:
+    return (
+        "Missing dependencies. Install with: "
+        f"{get_install_hint('marimo[mcp]')}"
+    )
+
+
+def resolve_completion_messages(
+    body: AiCompletionRequest,
+) -> tuple[list[UIMessage], bool]:
+    """Resolve UI messages for completion, synthesizing from prompt if needed.
+
+    Returns:
+        A tuple of (messages, support_multiple_cells).
+    """
+    if body.ui_messages:
+        return body.ui_messages, True
+
+    messages: list[UIMessage] = []
+    if body.prompt:
+        messages.append(
+            {
+                "id": generate_id("message"),
+                "role": "user",
+                "parts": [{"type": "text", "text": body.prompt}],
+            }
+        )
+    return messages, False
+
+
+def get_ai_config(config: MarimoConfig) -> AiConfig:
+    ai_config = config.ai
+    if ai_config is None:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail="AI is not configured. Configure them in the settings dialog.",
+        )
+    return ai_config
+
+
+def get_provider_config(model: str, config: MarimoConfig) -> AnyProviderConfig:
+    def secret_resolver(key: str) -> str | None:
+        return get_secret_value(key, config)
+
+    return AnyProviderConfig.for_model(
+        model,
+        get_ai_config(config),
+        secret_resolver=secret_resolver,
+    )
+
+
+@router.get("/models/{provider_name}")
+@requires("edit")
+async def list_provider_models(*, request: Request) -> Response:
+    """
+    description: List models for a supported provider without modifying configuration.
+    parameters:
+      - in: path
+        name: provider_name
+        schema:
+          type: string
+        required: true
+        description: Provider identifier, such as `openrouter` or a custom-provider name.
+    responses:
+      200:
+        description: Available models for the provider.
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProviderModelsResponse"
+    """
+    import asyncio
+    import json
+    import ssl
+    from urllib.error import HTTPError, URLError
+    from urllib.request import (
+        HTTPRedirectHandler,
+        HTTPSHandler,
+        Request as URLRequest,
+        build_opener,
+    )
+
+    app_state = AppState(request)
+    app_state.require_current_session()
+    config = app_state.app_config_manager.get_config(hide_secrets=False)
+    ai_config = get_ai_config(config)
+    provider_name = request.path_params["provider_name"]
+
+    def secret_resolver(key: str) -> str | None:
+        return get_secret_value(key, config)
+
+    if provider_name in (ai_config.custom_providers or {}):
+        provider = AnyProviderConfig.for_custom_provider(
+            ai_config, provider_name, secret_resolver=secret_resolver
+        )
+    elif provider_name == "openrouter":
+        provider = AnyProviderConfig.for_openrouter(
+            ai_config, secret_resolver=secret_resolver
+        )
+    else:
+        raise HTTPException(
+            status_code=404, detail="Model discovery is not available."
+        )
+    if provider_name == "openrouter" and not provider.api_key:
+        raise HTTPException(
+            status_code=400,
+            detail="OpenRouter API key not configured. Go to Settings > AI to configure.",
+        )
+
+    base_url = provider.base_url
+    if not base_url:
+        raise HTTPException(
+            status_code=400, detail="A saved provider base URL is required."
+        )
+    from urllib.parse import urlsplit
+
+    try:
+        target = urlsplit(base_url)
+    except ValueError:
+        raise HTTPException(
+            status_code=400, detail="Invalid provider base URL."
+        ) from None
+
+    if (
+        target.scheme not in ("http", "https")
+        or not target.hostname
+        or target.username is not None
+        or target.password is not None
+        or target.query
+        or target.fragment
+    ):
+        raise HTTPException(
+            status_code=400, detail="Invalid provider base URL."
+        )
+    headers = dict(provider.extra_headers or {})
+    if provider.api_key:
+        headers["Authorization"] = f"Bearer {provider.api_key}"
+
+    class NoRedirect(HTTPRedirectHandler):
+        def redirect_request(
+            self,
+            req: URLRequest,
+            fp: IO[bytes],
+            code: int,
+            msg: str,
+            headers: HTTPMessage,
+            newurl: str,
+        ) -> None:
+            del req, fp, code, msg, headers, newurl
+
+    def fetch_catalog() -> object:
+        context = ssl.create_default_context(
+            cafile=provider.ca_bundle_path
+            if provider.ssl_verify is not False
+            else None
+        )
+        if provider.ssl_verify is False:
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+        elif provider.client_pem:
+            context.load_cert_chain(provider.client_pem)
+        opener = build_opener(NoRedirect(), HTTPSHandler(context=context))
+        upstream_request = URLRequest(
+            f"{base_url.rstrip('/')}/models", headers=headers
+        )
+        with opener.open(upstream_request, timeout=20.0) as upstream:
+            if not 200 <= upstream.status < 300:
+                raise HTTPException(
+                    status_code=502,
+                    detail="Provider model catalog request failed.",
+                )
+            return json.load(upstream)
+
+    try:
+        payload = await asyncio.to_thread(fetch_catalog)
+    except HTTPError as exc:
+        status_code = 400 if exc.code in (401, 403) else 502
+        detail = (
+            "Provider rejected the configured credentials or access."
+            if exc.code in (401, 403)
+            else "Provider model catalog request failed."
+        )
+        exc.close()
+        raise HTTPException(status_code=status_code, detail=detail) from None
+    except TimeoutError:
+        raise HTTPException(
+            status_code=504, detail="Provider model discovery timed out."
+        ) from None
+    except URLError as exc:
+        timed_out = isinstance(exc.reason, TimeoutError)
+        raise HTTPException(
+            status_code=504 if timed_out else 502,
+            detail=(
+                "Provider model discovery timed out."
+                if timed_out
+                else "Unable to load the provider model catalog."
+            ),
+        ) from None
+    except (ValueError, OSError):
+        raise HTTPException(
+            status_code=502,
+            detail="Unable to load the provider model catalog.",
+        ) from None
+
+    entries = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(entries, list):
+        raise HTTPException(
+            status_code=502,
+            detail="Provider returned an invalid model catalog.",
+        )
+    models: dict[str, dict[str, str]] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        model_id = entry.get("id")
+        if not isinstance(model_id, str) or not model_id.strip():
+            continue
+        name = entry.get("name")
+        models[model_id] = {
+            "id": model_id,
+            "name": name if isinstance(name, str) and name else model_id,
+        }
+    response = StructResponse(
+        ProviderModelsResponse(
+            models=[
+                ProviderModel(**model)
+                for model in sorted(
+                    models.values(), key=lambda model: model["id"]
+                )
+            ]
+        )
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@router.post("/completion")
+@requires("edit")
+async def ai_completion(
+    *,
+    request: Request,
+) -> StreamingResponse:
+    """
+    parameters:
+        - in: header
+          name: Marimo-Session-Id
+          schema:
+            type: string
+          required: true
+    requestBody:
+        description: The request body for AI completion
+        required: true
+        content:
+            application/json:
+                schema:
+                    $ref: "#/components/schemas/AiCompletionRequest"
+    responses:
+        200:
+            description: Get AI completion for a prompt
+            content:
+                application/json:
+                    schema:
+                        type: object
+                        additionalProperties: true
+    """
+    app_state = AppState(request)
+    app_state.require_current_session()
+    session_id = app_state.require_current_session_id()
+    config = app_state.app_config_manager.get_config(hide_secrets=False)
+    body = await parse_request(
+        request, cls=AiCompletionRequest, allow_unknown_keys=True
+    )
+    ai_config = get_ai_config(config)
+
+    custom_rules = ai_config.rules
+    messages, support_multiple_cells = resolve_completion_messages(body)
+
+    system_prompt = get_refactor_or_insert_notebook_cell_system_prompt(
+        language=body.language,
+        is_insert=False,
+        support_multiple_cells=support_multiple_cells,
+        custom_rules=custom_rules,
+        cell_code=body.code,
+        selected_text=body.selected_text,
+        other_cell_codes=body.include_other_code,
+        context=body.context,
+    )
+
+    model = get_edit_model(ai_config)
+    provider = get_completion_provider(
+        get_provider_config(model, config),
+        model=model,
+        session_id=body.id or f"{session_id}:completion",
+    )
+
+    # These models require the optional Pydantic AI dependency checked above.
+    from marimo._server.ai.completion_output import (
+        CELL_COMPLETION_DATA_TYPE,
+        NOTEBOOK_CELLS_COMPLETION_DATA_TYPE,
+        CellCompletion,
+        NotebookCellsCompletion,
+    )
+
+    output_type = (
+        NotebookCellsCompletion if support_multiple_cells else CellCompletion
+    )
+    data_type = (
+        NOTEBOOK_CELLS_COMPLETION_DATA_TYPE
+        if support_multiple_cells
+        else CELL_COMPLETION_DATA_TYPE
+    )
+
+    return await provider.stream_structured_completion(
+        messages=messages,
+        system_prompt=system_prompt,
+        max_tokens=get_max_tokens(config),
+        output_type=output_type,
+        data_type=data_type,
+        stream_options=StreamOptions(
+            span_info=SpanInfo(
+                endpoint="completion",
+                model=model,
+                language=body.language,
+                session_id=session_id,
+            )
+        ),
+    )
+
+
+@router.post("/chat")
+@requires("edit")
+async def ai_chat(
+    *,
+    request: Request,
+) -> StreamingResponse:
+    """
+    parameters:
+        - in: header
+          name: Marimo-Session-Id
+          schema:
+            type: string
+          required: true
+    requestBody:
+        description: The request body for AI chat
+        required: true
+        content:
+            application/json:
+                schema:
+                    $ref: "#/components/schemas/ChatRequest"
+    """
+    app_state = AppState(request)
+    session = app_state.require_current_session()
+    session_id = app_state.require_current_session_id()
+    accept = request.headers.get("accept", SSE_CONTENT_TYPE)
+    config = app_state.app_config_manager.get_config(hide_secrets=False)
+    body = await parse_request(
+        request, cls=ChatRequest, allow_unknown_keys=True
+    )
+    ai_config = get_ai_config(config)
+    custom_rules = ai_config.rules
+
+    mode: CopilotMode = ai_config.mode
+    if mode == "manual":
+        mode = "ask"
+    system_prompt = get_chat_system_prompt(
+        custom_rules=custom_rules,
+        mode=mode,
+    )
+
+    max_tokens = get_max_tokens(config)
+
+    model = body.model or get_chat_model(ai_config)
+    provider = get_completion_provider(
+        get_provider_config(model, config),
+        model=model,
+        session_id=body.id or f"{session_id}:chat",
+    )
+    additional_tools = body.tools or []
+
+    stream_options = StreamOptions(
+        format_stream=True,
+        text_only=False,
+        accept=accept,
+        span_info=SpanInfo(
+            endpoint="chat",
+            model=model,
+            mode=mode,
+            session_id=session_id,
+        ),
+    )
+    enable_capabilities = body.options.web_search
+
+    # TODO: Unify these paths behind one toolset with different access levels.
+    # Full access should use our Pair MCP scoped to this notebook.
+    if mode == "code_mode":
+        return await provider.stream_completion_harness(
+            messages=body.ui_messages,
+            system_prompt=system_prompt,
+            session=session,
+            request=request,
+            max_tokens=max_tokens,
+            enable_capabilities=enable_capabilities,
+            stream_options=stream_options,
+        )
+
+    return await provider.stream_completion(
+        messages=body.ui_messages,
+        system_prompt=system_prompt,
+        max_tokens=max_tokens,
+        additional_tools=additional_tools,
+        enable_capabilities=enable_capabilities,
+        stream_options=stream_options,
+    )
+
+
+@router.post("/inline_completion")
+@requires("edit")
+async def ai_inline_completion(
+    *,
+    request: Request,
+) -> PlainTextResponse:
+    """
+    parameters:
+        - in: header
+          name: Marimo-Session-Id
+          schema:
+            type: string
+          required: true
+    requestBody:
+        description: The request body for AI inline completion
+        required: true
+        content:
+            application/json:
+                schema:
+                    $ref: "#/components/schemas/AiInlineCompletionRequest"
+    responses:
+        200:
+            description: Get AI inline completion for code
+            content:
+                text/plain:
+                    schema:
+                        type: string
+    """
+    app_state = AppState(request)
+    app_state.require_current_session()
+    session_id = app_state.require_current_session_id()
+    config = app_state.app_config_manager.get_config(hide_secrets=False)
+    body = await parse_request(
+        request, cls=AiInlineCompletionRequest, allow_unknown_keys=True
+    )
+    # Use FIM (Fill-In-Middle) format for inline completion
+    prompt = f"{FIM_PREFIX_TAG}{body.prefix}{FIM_SUFFIX_TAG}{body.suffix}{FIM_MIDDLE_TAG}"
+    system_prompt = get_inline_system_prompt(language=body.language)
+
+    # This is currently not configurable and smaller than the default
+    # of 4096, since it is smaller/faster for inline completions
+    INLINE_COMPLETION_MAX_TOKENS = 1024
+
+    model = get_autocomplete_model(config)
+    provider_config = get_provider_config(model, config)
+    # Inline completion never uses tools
+    if provider_config.tools:
+        provider_config.tools.clear()
+
+    provider = get_completion_provider(
+        provider_config,
+        model=model,
+        session_id=f"{session_id}:inline_completion",
+    )
+    try:
+        content = await provider.completion(
+            messages=[create_simple_prompt(prompt)],
+            system_prompt=system_prompt,
+            max_tokens=INLINE_COMPLETION_MAX_TOKENS,
+            thinking=False,
+            additional_tools=[],
+            enable_capabilities=False,
+            span_info=SpanInfo(
+                endpoint="inline_completion",
+                model=model,
+                language=body.language,
+                session_id=session_id,
+            ),
+        )
+    except Exception as e:
+        LOGGER.error("Error in AI inline completion: %s", e)
+        raise HTTPException(
+            status_code=500,  # Internal Server Error
+            detail=f"AI completion failed: {e!s}",
+        ) from None
+
+    # Filter out `<|file_separator|>` which is sometimes returned FIM models
+    content = content.replace("<|file_separator|>", "")
+
+    return PlainTextResponse(
+        content=content,
+        media_type="text/plain",
+    )
+
+
+@router.post("/invoke_tool")
+@requires("edit")
+async def invoke_tool(
+    *,
+    request: Request,
+) -> Response:
+    """
+    parameters:
+        - in: header
+          name: Marimo-Session-Id
+          schema:
+            type: string
+          required: true
+    requestBody:
+        description: The request body for tool invocation
+        required: true
+        content:
+            application/json:
+                schema:
+                    $ref: "#/components/schemas/InvokeAiToolRequest"
+    responses:
+        200:
+            description: Tool invocation result
+            content:
+                application/json:
+                    schema:
+                        $ref: "#/components/schemas/InvokeAiToolResponse"
+    """
+    app_state = AppState(request)
+    app_state.require_current_session()
+
+    body = await parse_request(request, cls=InvokeAiToolRequest)
+
+    try:
+        # Invoke the tool
+        result = await get_tool_manager().invoke_tool(
+            body.tool_name, body.arguments
+        )
+
+        return StructResponse(
+            InvokeAiToolResponse(
+                success=result.error is None,
+                tool_name=result.tool_name,
+                result=result.result,
+                error=result.error,
+            )
+        )
+
+    except Exception as e:
+        LOGGER.error("Error invoking AI tool %s: %s", body.tool_name, e)
+        # Return error response instead of letting it crash
+        return StructResponse(
+            InvokeAiToolResponse(
+                success=False,
+                tool_name=body.tool_name,
+                result=None,
+                error=f"Tool invocation failed: {e!s}",
+            )
+        )
+
+
+@router.get("/mcp/status")
+@requires("edit")
+async def mcp_status(
+    *,
+    request: Request,
+) -> Response:
+    """
+    responses:
+        200:
+            description: Get MCP server status
+            content:
+                application/json:
+                    schema:
+                        $ref: "#/components/schemas/MCPStatusResponse"
+    """
+    del request
+    try:
+        # Try to get MCP client
+        mcp_client = get_mcp_client()
+
+        # Get all server statuses
+        server_statuses = mcp_client.get_all_server_statuses()
+
+        # Map internal status enum to API status strings
+        status_map: dict[
+            MCPServerStatus,
+            Literal["pending", "connected", "disconnected", "failed"],
+        ] = {
+            MCPServerStatus.CONNECTED: "connected",
+            MCPServerStatus.CONNECTING: "pending",
+            MCPServerStatus.DISCONNECTED: "disconnected",
+            MCPServerStatus.ERROR: "failed",
+        }
+
+        servers = {
+            name: status_map.get(status, "failed")
+            for name, status in server_statuses.items()
+        }
+
+        # Determine overall status
+        overall_status: Literal["ok", "partial", "error"] = "ok"
+        if not servers:
+            # No servers configured
+            overall_status = "ok"
+            error = None
+        elif all(s == "connected" for s in servers.values()):
+            # All servers connected
+            overall_status = "ok"
+            error = None
+        elif any(s == "connected" for s in servers.values()):
+            # Some servers connected
+            overall_status = "partial"
+            failed_servers = [
+                name for name, status in servers.items() if status == "failed"
+            ]
+            error = (
+                f"Some servers failed to connect: {', '.join(failed_servers)}"
+            )
+        else:
+            # No servers connected or all failed
+            overall_status = "error"
+            error = "No MCP servers connected"
+
+        return StructResponse(
+            MCPStatusResponse(
+                status=overall_status,
+                error=error,
+                servers=servers,
+            )
+        )
+
+    except ModuleNotFoundError:
+        # MCP dependencies not installed
+        return StructResponse(
+            MCPStatusResponse(
+                status="error",
+                error=_missing_mcp_dependencies_message(),
+                servers={},
+            )
+        )
+    except Exception as e:
+        LOGGER.error(f"Error getting MCP status: {e}")
+        return StructResponse(
+            MCPStatusResponse(
+                status="error",
+                error=str(e),
+                servers={},
+            )
+        )
+
+
+@router.post("/mcp/refresh")
+@requires("edit")
+async def mcp_refresh(
+    *,
+    request: Request,
+) -> Response:
+    """
+    parameters:
+        - in: header
+          name: Marimo-Session-Id
+          schema:
+            type: string
+          required: true
+    responses:
+        200:
+            description: Refresh MCP server configuration
+            content:
+                application/json:
+                    schema:
+                        $ref: "#/components/schemas/MCPRefreshResponse"
+    """
+    app_state = AppState(request)
+    app_state.require_current_session()
+
+    try:
+        # Get the MCP client
+        mcp_client = get_mcp_client()
+
+        # Get current config
+        config = app_state.app_config_manager.get_config(hide_secrets=False)
+        mcp_config = config.mcp
+
+        if mcp_config is None:
+            return StructResponse(
+                MCPRefreshResponse(
+                    success=False,
+                    error="MCP configuration is not set",
+                    servers={},
+                )
+            )
+
+        # Reconfigure the client with the current configuration
+        # This will handle disconnecting/reconnecting as needed
+        await mcp_client.configure(mcp_config)
+
+        # Get updated server statuses
+        server_statuses = mcp_client.get_all_server_statuses()
+
+        # Map status to success boolean
+        servers = {
+            name: status == MCPServerStatus.CONNECTED
+            for name, status in server_statuses.items()
+        }
+
+        # Overall success if all servers are connected (or no servers)
+        success = len(servers) == 0 or all(servers.values())
+
+        error = None
+        if not success:
+            failed_servers = [
+                name for name, connected in servers.items() if not connected
+            ]
+            error = (
+                f"Some servers failed to connect: {', '.join(failed_servers)}"
+            )
+
+        return StructResponse(
+            MCPRefreshResponse(
+                success=success,
+                error=error,
+                servers=servers,
+            )
+        )
+
+    except ModuleNotFoundError:
+        # MCP dependencies not installed
+        return StructResponse(
+            MCPRefreshResponse(
+                success=False,
+                error=_missing_mcp_dependencies_message(),
+                servers={},
+            )
+        )
+    except Exception as e:
+        LOGGER.error(f"Error refreshing MCP: {e}")
+        return StructResponse(
+            MCPRefreshResponse(
+                success=False,
+                error=str(e),
+                servers={},
+            )
+        )

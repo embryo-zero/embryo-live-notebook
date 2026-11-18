@@ -1,0 +1,743 @@
+/* Copyright 2026 Marimo. All rights reserved. */
+
+import { defaultUserConfig } from "@/core/config/config-schema";
+
+import { EditorState } from "@codemirror/state";
+import { EditorView } from "@codemirror/view";
+import { getDefaultStore } from "jotai";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { mockDocumentModel } from "@/__mocks__/document";
+import { MockNotebook } from "@/__mocks__/notebook";
+import { cellId } from "@/__tests__/branded";
+import { notebookAtom } from "@/core/cells/cells";
+import type { CellId } from "@/core/cells/ids";
+import { OverridingHotkeyProvider } from "@/core/hotkeys/hotkeys";
+import {
+  cell,
+  CONFIG,
+  document as documentOf,
+  withCells,
+} from "@/core/notebook/document/__tests__/fixtures";
+import { cellConfigExtension } from "../../../codemirror/config/extension";
+import { adaptiveLanguageConfiguration } from "../../../codemirror/language/extension";
+import { stagedAICellsAtom } from "../../staged-cells";
+import { ToolExecutionError } from "../base";
+import { EditNotebookTool } from "../edit-notebook-tool";
+
+// Mock scrollAndHighlightCell
+vi.mock("@/components/editor/links/cell-link", () => ({
+  scrollAndHighlightCell: vi.fn(),
+}));
+
+function createMockEditorView(code: string): EditorView {
+  return new EditorView({
+    state: EditorState.create({
+      doc: code,
+      extensions: [
+        adaptiveLanguageConfiguration({
+          cellId: cellId("cell1"),
+          completionConfig: {
+            ...defaultUserConfig().completion,
+            copilot: false,
+            activate_on_typing: true,
+            signature_hint_on_typing: false,
+          },
+          hotkeys: new OverridingHotkeyProvider({}),
+          placeholderType: "marimo-import",
+          lspConfig: { ...defaultUserConfig().language_servers },
+        }),
+        cellConfigExtension({
+          cellId: cellId("cell1"),
+          completionConfig: {
+            ...defaultUserConfig().completion,
+            copilot: false,
+            activate_on_typing: true,
+            signature_hint_on_typing: false,
+          },
+          hotkeys: new OverridingHotkeyProvider({}),
+          placeholderType: "marimo-import",
+          lspConfig: { ...defaultUserConfig().language_servers },
+          diagnosticsConfig: { ...defaultUserConfig().diagnostics },
+        }),
+      ],
+    }),
+  });
+}
+
+describe("EditNotebookTool", () => {
+  let store: ReturnType<typeof getDefaultStore>;
+  let tool: EditNotebookTool;
+  let cellId1: CellId;
+  let cellId2: CellId;
+  let toolContext: {
+    addStagedCell: ReturnType<typeof vi.fn>;
+    createCell: ReturnType<typeof vi.fn>;
+    store: ReturnType<typeof getDefaultStore>;
+  };
+
+  beforeEach(() => {
+    store = getDefaultStore();
+
+    // Reset atom states first
+    store.set(stagedAICellsAtom, new Map());
+
+    toolContext = {
+      addStagedCell: vi.fn(({ cellId, edit }) => {
+        const current = store.get(stagedAICellsAtom);
+        store.set(stagedAICellsAtom, new Map(current).set(cellId, edit));
+      }),
+      createCell: vi.fn(),
+      store,
+    };
+    tool = new EditNotebookTool();
+
+    cellId1 = cellId("cell-1");
+    cellId2 = cellId("cell-2");
+
+    // Reset mocks
+    vi.clearAllMocks();
+  });
+
+  describe("tool metadata", () => {
+    it("should have correct metadata", () => {
+      expect(tool.name).toBe("edit_notebook_tool");
+      expect(tool.description).toBeDefined();
+      expect(tool.description.baseDescription).toContain("Propose cell edits");
+      expect(tool.schema).toBeDefined();
+      expect(tool.outputSchema).toBeDefined();
+      expect(tool.mode).toEqual(["agent"]);
+    });
+  });
+
+  describe("update_cell operation", () => {
+    it("should update cell with new code", async () => {
+      const oldCode = "x = 1";
+      const newCode = "x = 2";
+
+      // Create notebook state with mock editor view
+      const editorView = createMockEditorView(oldCode);
+      const notebook = MockNotebook.notebookState({
+        cellData: {
+          [cellId1]: { code: oldCode },
+        },
+      });
+      notebook.cellHandles[cellId1] = { current: { editorView } } as never;
+      store.set(notebookAtom, notebook);
+
+      const result = await tool.handler(
+        {
+          edit: {
+            type: "update_cell",
+            position: { type: "relative", cellId: cellId1 },
+            code: newCode,
+          },
+        },
+        toolContext as never,
+      );
+
+      expect(result.status).toBe("success");
+      expect(editorView.state.doc.toString()).toBe(newCode);
+
+      // Check that cell was staged
+      const stagedCells = store.get(stagedAICellsAtom);
+      expect(stagedCells.has(cellId1)).toBe(true);
+      expect(stagedCells.get(cellId1)).toEqual({
+        type: "update_cell",
+        previousCode: oldCode,
+      });
+
+      // Update cell again
+      const result2 = await tool.handler(
+        {
+          edit: {
+            type: "update_cell",
+            position: { type: "relative", cellId: cellId1 },
+            code: "x = 3",
+          },
+        },
+        toolContext as never,
+      );
+
+      expect(result2.status).toBe("success");
+      expect(editorView.state.doc.toString()).toBe("x = 3");
+
+      const stagedCells2 = store.get(stagedAICellsAtom);
+      expect(stagedCells2.has(cellId1)).toBe(true);
+      expect(stagedCells2.get(cellId1)).toEqual({
+        type: "update_cell",
+        previousCode: oldCode, // Should keep the original code
+      });
+    });
+
+    it("should skip no-op edits where code hasn't changed", async () => {
+      const code = "x = 1";
+
+      const editorView = createMockEditorView(code);
+      const notebook = MockNotebook.notebookState({
+        cellData: {
+          [cellId1]: { code },
+        },
+      });
+      notebook.cellHandles[cellId1] = { current: { editorView } } as never;
+      store.set(notebookAtom, notebook);
+
+      const result = await tool.handler(
+        {
+          edit: {
+            type: "update_cell",
+            position: { type: "relative", cellId: cellId1 },
+            code: code, // Same code as current
+          },
+        },
+        toolContext as never,
+      );
+
+      expect(result.status).toBe("success");
+
+      // Should NOT stage the cell or update the editor
+      expect(toolContext.addStagedCell).not.toHaveBeenCalled();
+      expect(editorView.state.doc.toString()).toBe(code);
+
+      // No staged cells
+      const stagedCells = store.get(stagedAICellsAtom);
+      expect(stagedCells.size).toBe(0);
+    });
+
+    it("should skip no-op edits that revert to original code", async () => {
+      const originalCode = "x = 1";
+      const modifiedCode = "x = 2";
+
+      const editorView = createMockEditorView(originalCode);
+      const notebook = MockNotebook.notebookState({
+        cellData: {
+          [cellId1]: { code: originalCode },
+        },
+      });
+      notebook.cellHandles[cellId1] = { current: { editorView } } as never;
+      store.set(notebookAtom, notebook);
+
+      // First edit: change the code
+      await tool.handler(
+        {
+          edit: {
+            type: "update_cell",
+            position: { type: "relative", cellId: cellId1 },
+            code: modifiedCode,
+          },
+        },
+        toolContext as never,
+      );
+
+      expect(toolContext.addStagedCell).toHaveBeenCalledTimes(1);
+
+      // Second edit: revert back to the original code
+      const result = await tool.handler(
+        {
+          edit: {
+            type: "update_cell",
+            position: { type: "relative", cellId: cellId1 },
+            code: originalCode, // Same as the previousCode
+          },
+        },
+        toolContext as never,
+      );
+
+      expect(result.status).toBe("success");
+
+      // addStagedCell should not be called again (still 1 from the first edit)
+      expect(toolContext.addStagedCell).toHaveBeenCalledTimes(1);
+    });
+
+    it("should throw error when cell ID doesn't exist", async () => {
+      const notebook = MockNotebook.notebookState({
+        cellData: {
+          [cellId1]: { code: "x = 1" },
+        },
+      });
+      store.set(notebookAtom, notebook);
+
+      await expect(
+        tool.handler(
+          {
+            edit: {
+              type: "update_cell",
+              position: { cellId: cellId("nonexistent") },
+              code: "x = 2",
+            },
+          },
+          toolContext as never,
+        ),
+      ).rejects.toThrow(ToolExecutionError);
+
+      await expect(
+        tool.handler(
+          {
+            edit: {
+              type: "update_cell",
+              position: { cellId: cellId("nonexistent") },
+              code: "x = 2",
+            },
+          },
+          toolContext as never,
+        ),
+      ).rejects.toThrow("Cell not found");
+    });
+
+    it("should throw error when cell editor not found", async () => {
+      const notebook = MockNotebook.notebookState({
+        cellData: {
+          [cellId1]: { code: "x = 1" },
+        },
+      });
+      // Don't set editorView
+      notebook.cellHandles[cellId1] = { current: null } as never;
+      store.set(notebookAtom, notebook);
+
+      await expect(
+        tool.handler(
+          {
+            edit: {
+              type: "update_cell",
+              position: { type: "relative", cellId: cellId1 },
+              code: "x = 2",
+            },
+          },
+          toolContext as never,
+        ),
+      ).rejects.toThrow("Cell editor not found");
+    });
+
+    it("should throw error when cellId is missing for update_cell", async () => {
+      const notebook = MockNotebook.notebookState({
+        cellData: {
+          [cellId1]: { code: "x = 1" },
+        },
+      });
+      store.set(notebookAtom, notebook);
+
+      await expect(
+        tool.handler(
+          {
+            edit: {
+              type: "update_cell",
+              position: {},
+              code: "x = 2",
+            },
+          },
+          toolContext as never,
+        ),
+      ).rejects.toThrow("Cell ID is required for update_cell");
+    });
+
+    it("should throw error when code is missing for update_cell", async () => {
+      const editorView = createMockEditorView("x = 1");
+      const notebook = MockNotebook.notebookState({
+        cellData: {
+          [cellId1]: { code: "x = 1" },
+        },
+      });
+      notebook.cellHandles[cellId1] = { current: { editorView } } as never;
+      store.set(notebookAtom, notebook);
+
+      await expect(
+        tool.handler(
+          {
+            edit: {
+              type: "update_cell",
+              position: { cellId: cellId1 },
+            },
+          },
+          toolContext as never,
+        ),
+      ).rejects.toThrow("Code is required for update_cell");
+    });
+  });
+
+  describe("add_cell operation", () => {
+    it("should add cell at the end of the notebook", async () => {
+      const notebook = MockNotebook.notebookState({
+        cellData: {
+          [cellId1]: { code: "x = 1" },
+        },
+      });
+      store.set(notebookAtom, notebook);
+
+      const newCode = "y = 2";
+      const result = await tool.handler(
+        {
+          edit: {
+            type: "add_cell",
+            position: { type: "notebook_end" },
+            code: newCode,
+          },
+        },
+        toolContext as never,
+      );
+
+      expect(result.status).toBe("success");
+
+      // Check that a new cell was staged
+      const stagedCells = store.get(stagedAICellsAtom);
+      expect(stagedCells.size).toBe(1);
+      const [cellId, edit] = [...stagedCells.entries()][0];
+      expect(edit).toEqual({ type: "add_cell" });
+      expect(cellId).toBeDefined();
+    });
+
+    it("should add cell before a specific cell", async () => {
+      const notebook = MockNotebook.notebookState({
+        cellData: {
+          [cellId1]: { code: "x = 1" },
+          [cellId2]: { code: "x = 2" },
+        },
+      });
+      store.set(notebookAtom, notebook);
+
+      const newCode = "y = 2";
+      const result = await tool.handler(
+        {
+          edit: {
+            type: "add_cell",
+            position: { type: "relative", cellId: cellId2, before: true },
+            code: newCode,
+          },
+        },
+        toolContext as never,
+      );
+
+      expect(result.status).toBe("success");
+
+      // Check that a new cell was staged
+      const stagedCells = store.get(stagedAICellsAtom);
+      expect(stagedCells.size).toBe(1);
+      const [_cellId, edit] = [...stagedCells.entries()][0];
+      expect(edit).toEqual({ type: "add_cell" });
+    });
+
+    it("should add cell after a specific cell", async () => {
+      const notebook = MockNotebook.notebookState({
+        cellData: {
+          [cellId1]: { code: "x = 1" },
+          [cellId2]: { code: "x = 2" },
+        },
+      });
+      store.set(notebookAtom, notebook);
+
+      const newCode = "y = 2";
+      const result = await tool.handler(
+        {
+          edit: {
+            type: "add_cell",
+            position: { type: "relative", cellId: cellId2, before: false },
+            code: newCode,
+          },
+        },
+        toolContext as never,
+      );
+
+      expect(result.status).toBe("success");
+
+      // Check that a new cell was staged
+      const stagedCells = store.get(stagedAICellsAtom);
+      expect(stagedCells.size).toBe(1);
+    });
+
+    it("should add cell at the end of a specific column", async () => {
+      const notebook = MockNotebook.notebookState({
+        cellData: {
+          [cellId1]: { code: "x = 1" },
+          [cellId2]: { code: "x = 2" },
+        },
+      });
+      store.set(notebookAtom, notebook);
+      // The layout reads columns from the document's cells.
+      const { stop } = mockDocumentModel(
+        store,
+        withCells(documentOf(), {
+          c1: null,
+          c2: null,
+          [cellId1]: cell(cellId1, "x = 1"),
+          [cellId2]: cell(cellId2, "x = 2", {
+            config: { ...CONFIG, column: 1 },
+          }),
+        }),
+      );
+
+      try {
+        const result = await tool.handler(
+          {
+            edit: {
+              type: "add_cell",
+              position: { type: "column_end", columnIndex: 1 },
+              code: "y = 2",
+            },
+          },
+          toolContext as never,
+        );
+
+        expect(result.status).toBe("success");
+        expect(store.get(stagedAICellsAtom).size).toBe(1);
+      } finally {
+        stop();
+      }
+    });
+
+    it("should throw error when cell ID doesn't exist for position", async () => {
+      const notebook = MockNotebook.notebookState({
+        cellData: {
+          [cellId1]: { code: "x = 1" },
+        },
+      });
+      store.set(notebookAtom, notebook);
+
+      await expect(
+        tool.handler(
+          {
+            edit: {
+              type: "add_cell",
+              position: {
+                type: "relative",
+                cellId: cellId("nonexistent"),
+                before: true,
+              },
+              code: "y = 2",
+            },
+          },
+          toolContext as never,
+        ),
+      ).rejects.toThrow("Cell not found");
+    });
+
+    it("should throw error when column index is out of range", async () => {
+      const notebook = MockNotebook.notebookState({
+        cellData: {
+          [cellId1]: { code: "x = 1" },
+        },
+      });
+      store.set(notebookAtom, notebook);
+
+      await expect(
+        tool.handler(
+          {
+            edit: {
+              type: "add_cell",
+              position: {
+                type: "column_end",
+                columnIndex: -1,
+              },
+              code: "y = 2",
+            },
+          },
+          toolContext as never,
+        ),
+      ).rejects.toThrow("Column index is out of range");
+    });
+
+    it("should throw error when cellId is missing for add_cell with relative position", async () => {
+      const notebook = MockNotebook.notebookState({
+        cellData: {
+          [cellId1]: { code: "x = 1" },
+        },
+      });
+      store.set(notebookAtom, notebook);
+
+      await expect(
+        tool.handler(
+          {
+            edit: {
+              type: "add_cell",
+              position: {
+                type: "relative",
+                before: true,
+              },
+              code: "y = 2",
+            },
+          },
+          toolContext as never,
+        ),
+      ).rejects.toThrow(
+        "Cell ID is required for add_cell with relative position",
+      );
+    });
+
+    it("should throw error when before is missing for add_cell with relative position", async () => {
+      const notebook = MockNotebook.notebookState({
+        cellData: {
+          [cellId1]: { code: "x = 1" },
+        },
+      });
+      store.set(notebookAtom, notebook);
+
+      await expect(
+        tool.handler(
+          {
+            edit: {
+              type: "add_cell",
+              position: {
+                type: "relative",
+                cellId: cellId1,
+              },
+              code: "y = 2",
+            },
+          },
+          toolContext as never,
+        ),
+      ).rejects.toThrow(
+        "Before is required for add_cell with relative position",
+      );
+    });
+
+    it("should throw error when columnIndex is missing for add_cell with column_end position", async () => {
+      const notebook = MockNotebook.notebookState({
+        cellData: {
+          [cellId1]: { code: "x = 1" },
+        },
+      });
+      store.set(notebookAtom, notebook);
+
+      await expect(
+        tool.handler(
+          {
+            edit: {
+              type: "add_cell",
+              position: {
+                type: "column_end",
+              },
+              code: "y = 2",
+            },
+          },
+          toolContext as never,
+        ),
+      ).rejects.toThrow(
+        "Column index is required for add_cell with column_end position",
+      );
+    });
+  });
+
+  describe("delete_cell operation", () => {
+    it("should delete a cell", async () => {
+      const cellCode = "x = 1";
+      const editorView = createMockEditorView(cellCode);
+      const notebook = MockNotebook.notebookState({
+        cellData: {
+          [cellId1]: { code: cellCode },
+          [cellId2]: { code: "x = 2" },
+        },
+      });
+      notebook.cellHandles[cellId1] = { current: { editorView } } as never;
+      store.set(notebookAtom, notebook);
+
+      const result = await tool.handler(
+        {
+          edit: {
+            type: "delete_cell",
+            position: { cellId: cellId1 },
+          },
+        },
+        toolContext as never,
+      );
+
+      expect(result.status).toBe("success");
+
+      // Check that cell was staged for deletion
+      const stagedCells = store.get(stagedAICellsAtom);
+      expect(stagedCells.has(cellId1)).toBe(true);
+      expect(stagedCells.get(cellId1)).toEqual({
+        type: "delete_cell",
+        previousCode: cellCode,
+      });
+    });
+
+    it("should throw error when cell ID doesn't exist", async () => {
+      const notebook = MockNotebook.notebookState({
+        cellData: {
+          [cellId1]: { code: "x = 1" },
+        },
+      });
+      store.set(notebookAtom, notebook);
+
+      await expect(
+        tool.handler(
+          {
+            edit: {
+              type: "delete_cell",
+              position: { cellId: cellId("nonexistent") },
+            },
+          },
+          toolContext as never,
+        ),
+      ).rejects.toThrow("Cell not found");
+    });
+
+    it("should throw error when cell editor not found", async () => {
+      const notebook = MockNotebook.notebookState({
+        cellData: {
+          [cellId1]: { code: "x = 1" },
+        },
+      });
+      // Don't set editorView
+      notebook.cellHandles[cellId1] = { current: null } as never;
+      store.set(notebookAtom, notebook);
+
+      await expect(
+        tool.handler(
+          {
+            edit: {
+              type: "delete_cell",
+              position: { cellId: cellId1 },
+            },
+          },
+          toolContext as never,
+        ),
+      ).rejects.toThrow("Cell editor not found");
+    });
+
+    it("should throw error when cellId is missing for delete_cell", async () => {
+      const notebook = MockNotebook.notebookState({
+        cellData: {
+          [cellId1]: { code: "x = 1" },
+        },
+      });
+      store.set(notebookAtom, notebook);
+
+      await expect(
+        tool.handler(
+          {
+            edit: {
+              type: "delete_cell",
+              position: {},
+            },
+          },
+          toolContext as never,
+        ),
+      ).rejects.toThrow("Cell ID is required for delete_cell");
+    });
+  });
+
+  describe("return value", () => {
+    it("should return success status with next steps", async () => {
+      const notebook = MockNotebook.notebookState({
+        cellData: {
+          [cellId1]: { code: "x = 1" },
+        },
+      });
+      store.set(notebookAtom, notebook);
+
+      const result = await tool.handler(
+        {
+          edit: {
+            type: "add_cell",
+            position: { type: "notebook_end" },
+            code: "y = 2",
+          },
+        },
+        toolContext as never,
+      );
+
+      expect(result.status).toBe("success");
+      expect(result.next_steps).toBeDefined();
+      expect(Array.isArray(result.next_steps)).toBe(true);
+      expect(result.next_steps?.length).toBeGreaterThan(0);
+    });
+  });
+});

@@ -1,0 +1,301 @@
+/* Copyright 2026 Marimo. All rights reserved. */
+
+import type { unstable_NotebookCall } from "@marimo-team/client";
+import type { PyodideInterface } from "pyodide";
+import {
+  createRPC,
+  createRPCRequestHandler,
+  createWorkerParentTransport,
+  type RPCSchema,
+} from "rpc-anywhere";
+import type { ParentSchema } from "@/core/wasm/rpc";
+import { shouldLoadDuckDBPackages } from "@/core/wasm/utils";
+import { TRANSPORT_ID } from "@/core/wasm/worker/constants";
+import { getPyodideVersion } from "@/core/wasm/worker/getPyodideVersion";
+import type { RawBridge, SerializedBridge } from "@/core/wasm/worker/types";
+import { Logger } from "@/utils/Logger";
+import { prettyError } from "../../../utils/errors";
+import { invariant } from "../../../utils/invariant";
+import { ReadonlyWasmController } from "./controller";
+
+declare const self: Window & {
+  pyodide: PyodideInterface;
+  controller: ReadonlyWasmController;
+};
+
+// Initialize pyodide
+async function loadPyodideAndPackages() {
+  const marimoVersion = getMarimoVersion();
+  const pyodideVersion = getPyodideVersion(marimoVersion);
+  try {
+    self.controller = new ReadonlyWasmController();
+    self.pyodide = await self.controller.bootstrap({
+      version: marimoVersion,
+      pyodideVersion: pyodideVersion,
+    });
+  } catch (error) {
+    Logger.error("Error bootstrapping", error);
+    rpc.send.initializedError({
+      error: prettyError(error),
+    });
+  }
+}
+
+const pyodideReadyPromise = loadPyodideAndPackages();
+/** An event of one session's notebook stream. */
+export interface IslandsNotebookEvent {
+  event: string;
+  sessionGeneration: number;
+}
+interface SessionRequest {
+  code: string;
+  appId: string;
+  sessionGeneration: number;
+}
+
+let activeSession:
+  | (Omit<SessionRequest, "code"> & { bridge: SerializedBridge })
+  | undefined;
+let sessionQueue = Promise.resolve();
+
+async function startSession(
+  opts: SessionRequest,
+  replace: boolean,
+): Promise<void> {
+  await pyodideReadyPromise;
+
+  try {
+    invariant(self.controller, "Controller not loaded");
+    if (replace) {
+      await stopActiveSession();
+    }
+    const notebook = await self.controller.mountFilesystem({
+      code: opts.code,
+      filename: `app-${opts.appId}.py`,
+    });
+    const session = await self.controller.prepareSession(notebook);
+    // Follow before the session instantiates. Each subscription begins with
+    // its own kernel-ready and the session's retained notifications.
+    try {
+      const host = session.bridge.notebook;
+      try {
+        // Host runs name cells, so the worker loads their imports itself.
+        host.set_package_loader(loadPackagesForCode);
+      } finally {
+        host.destroy();
+      }
+      await follow(session.bridge, opts.sessionGeneration);
+    } catch (error) {
+      await session.stop();
+      throw error;
+    }
+    void session.start().catch((error: unknown) => {
+      rpc.send.initializedError({ error: prettyError(error) });
+    });
+    if (!activeSession) {
+      activeSession = {
+        appId: opts.appId,
+        bridge: session.bridge,
+        sessionGeneration: opts.sessionGeneration,
+      };
+    }
+    rpc.send.initialized({});
+  } catch (error) {
+    rpc.send.initializedError({
+      error: prettyError(error),
+    });
+    throw error;
+  }
+}
+
+async function loadPackagesForCode(code: string): Promise<void> {
+  if (shouldLoadDuckDBPackages(code)) {
+    // Add pandas and duckdb to the code for mo.sql and for remote duckdb sources
+    code = `import pandas\n${code}`;
+    code = `import duckdb\n${code}`;
+    code = `import sqlglot\n${code}`;
+
+    // Polars + SQL requires pyarrow, and installing
+    // after notebook load does not work. As a heuristic,
+    // if it appears that the notebook uses polars, add pyarrow.
+    if (code.includes("polars")) {
+      code = `import pyarrow\n${code}`;
+    }
+  }
+
+  await self.pyodide.loadPackagesFromImports(code, {
+    messageCallback: Logger.log,
+    errorCallback: Logger.error,
+  });
+}
+
+async function stopActiveSession(): Promise<void> {
+  // Stopping closes every session and its notebook subscriptions.
+  await self.controller.stopSession();
+  activeSession = undefined;
+}
+
+async function follow(
+  bridge: SerializedBridge,
+  sessionGeneration: number,
+): Promise<void> {
+  const notebook = bridge.notebook;
+  try {
+    await notebook.subscribe(`island-${sessionGeneration}`, null, (event) => {
+      rpc.send.notebookEvent({ event, sessionGeneration });
+    });
+  } finally {
+    notebook.destroy();
+  }
+}
+
+function enqueueSession<T>(operation: () => Promise<T>): Promise<T> {
+  const result = sessionQueue.then(operation);
+  sessionQueue = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result;
+}
+
+// Handle RPC requests
+const requestHandler = createRPCRequestHandler({
+  /**
+   * Start the session
+   */
+  startSession: async (opts: SessionRequest) => {
+    await enqueueSession(() => startSession(opts, false));
+  },
+
+  replaceSession: async (opts: SessionRequest) => {
+    await enqueueSession(() => startSession(opts, true));
+  },
+
+  stopSession: async (opts: { appId: string; sessionGeneration: number }) => {
+    await enqueueSession(async () => {
+      if (
+        activeSession?.appId !== opts.appId ||
+        activeSession?.sessionGeneration !== opts.sessionGeneration
+      ) {
+        return;
+      }
+      invariant(self.controller, "Controller not loaded");
+      await stopActiveSession();
+    });
+  },
+
+  /**
+   * Load packages
+   */
+  loadPackages: async (opts: {
+    appId: string;
+    code: string;
+    sessionGeneration: number;
+  }) => {
+    await pyodideReadyPromise; // Make sure loading is done
+    await enqueueSession(async () => {
+      requireActiveBridge(opts);
+      await loadPackagesForCode(opts.code);
+    });
+  },
+
+  /** Deliver a notebook operation to the active session's host. */
+  notebookCall: async (opts: {
+    appId: string;
+    sessionGeneration: number;
+    call: unstable_NotebookCall;
+  }): Promise<unknown> => {
+    await pyodideReadyPromise;
+    return enqueueSession(async () => {
+      const { notebook } = requireActiveBridge(opts);
+      try {
+        return JSON.parse(await notebook.call(JSON.stringify(opts.call)));
+      } finally {
+        notebook.destroy();
+      }
+    });
+  },
+
+  /**
+   * Call a function on the bridge
+   */
+  bridge: async (opts: {
+    appId: string;
+    functionName: keyof RawBridge;
+    payload: {} | undefined | null;
+    sessionGeneration: number;
+  }) => {
+    await pyodideReadyPromise; // Make sure loading is done
+
+    const { functionName, payload } = opts;
+
+    // Perform the function call to the Python bridge
+    return enqueueSession(async () => {
+      const bridge = requireActiveBridge(opts);
+
+      // Serialize the payload
+      const payloadString =
+        payload == null
+          ? null
+          : typeof payload === "string"
+            ? payload
+            : JSON.stringify(payload);
+
+      // Make the request
+      const response =
+        payloadString == null
+          ? // @ts-expect-error ehh TypeScript
+            await bridge[functionName]()
+          : // @ts-expect-error ehh TypeScript
+            await bridge[functionName](payloadString);
+
+      // Post the response back to the main thread
+      return typeof response === "string" ? JSON.parse(response) : response;
+    });
+  },
+});
+
+function requireActiveBridge(opts: {
+  appId: string;
+  sessionGeneration: number;
+}): SerializedBridge {
+  const session = activeSession;
+  if (
+    !session ||
+    opts.appId !== session.appId ||
+    opts.sessionGeneration !== session.sessionGeneration
+  ) {
+    throw new Error("The marimo app session is no longer active.");
+  }
+  return session.bridge;
+}
+
+// create the iframe's schema
+export type WorkerSchema = RPCSchema<
+  {
+    messages: {
+      // Emitted when the worker is ready
+      ready: {};
+      // Emitted for each event of a session's notebook stream
+      notebookEvent: IslandsNotebookEvent;
+      // Emitted when the Pyodide is initialized
+      initialized: {};
+      // Emitted when the Pyodide fails to initialize
+      initializedError: { error: string };
+    };
+  },
+  typeof requestHandler
+>;
+
+const rpc = createRPC<WorkerSchema, ParentSchema>({
+  transport: createWorkerParentTransport({
+    transportId: TRANSPORT_ID,
+  }),
+  requestHandler,
+});
+
+rpc.send("ready", {});
+
+function getMarimoVersion() {
+  return self.name; // We store the version in the worker name
+}

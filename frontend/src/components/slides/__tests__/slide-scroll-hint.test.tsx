@@ -1,0 +1,235 @@
+/* Copyright 2026 Marimo. All rights reserved. */
+
+import { act, render, screen } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  shouldShowScrollHint,
+  SlideScrollContainer,
+} from "../slide-scroll-hint";
+
+describe("shouldShowScrollHint", () => {
+  it("shows when content overflows and scroll is at the top", () => {
+    expect(
+      shouldShowScrollHint({
+        scrollHeight: 800,
+        clientHeight: 400,
+        scrollTop: 0,
+      }),
+    ).toBe(true);
+  });
+
+  it("hides when content fits", () => {
+    expect(
+      shouldShowScrollHint({
+        scrollHeight: 300,
+        clientHeight: 400,
+        scrollTop: 0,
+      }),
+    ).toBe(false);
+  });
+
+  it("hides after the user scrolls down", () => {
+    expect(
+      shouldShowScrollHint({
+        scrollHeight: 800,
+        clientHeight: 400,
+        scrollTop: 40,
+      }),
+    ).toBe(false);
+  });
+
+  it("ignores sub-pixel overflow", () => {
+    expect(
+      shouldShowScrollHint({
+        scrollHeight: 401,
+        clientHeight: 400,
+        scrollTop: 0,
+      }),
+    ).toBe(false);
+  });
+
+  it("still shows within the top threshold", () => {
+    expect(
+      shouldShowScrollHint({
+        scrollHeight: 800,
+        clientHeight: 400,
+        scrollTop: 8,
+      }),
+    ).toBe(true);
+  });
+});
+
+describe("SlideScrollContainer", () => {
+  const resizeObservers: Array<{
+    callback: ResizeObserverCallback;
+    observe: ReturnType<typeof vi.fn>;
+    disconnect: ReturnType<typeof vi.fn>;
+  }> = [];
+
+  beforeEach(() => {
+    resizeObservers.length = 0;
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
+      cb(0);
+      return 0;
+    });
+    vi.stubGlobal("cancelAnimationFrame", vi.fn());
+    vi.stubGlobal(
+      "ResizeObserver",
+      class MockResizeObserver {
+        public callback: ResizeObserverCallback;
+        public observe = vi.fn();
+        public unobserve = vi.fn();
+        public disconnect = vi.fn();
+
+        public constructor(callback: ResizeObserverCallback) {
+          this.callback = callback;
+          resizeObservers.push(this);
+        }
+      },
+    );
+    vi.stubGlobal(
+      "MutationObserver",
+      class MockMutationObserver {
+        public observe = vi.fn();
+        public disconnect = vi.fn();
+        public takeRecords = vi.fn(() => []);
+      },
+    );
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function stubOverflow(
+    el: HTMLElement,
+    metrics: {
+      scrollHeight: number;
+      clientHeight: number;
+      scrollTop?: number;
+    },
+  ) {
+    Object.defineProperty(el, "scrollHeight", {
+      configurable: true,
+      get: () => metrics.scrollHeight,
+    });
+    Object.defineProperty(el, "clientHeight", {
+      configurable: true,
+      get: () => metrics.clientHeight,
+    });
+    Object.defineProperty(el, "scrollTop", {
+      configurable: true,
+      get: () => metrics.scrollTop ?? 0,
+      set: (value: number) => {
+        metrics.scrollTop = value;
+      },
+    });
+  }
+
+  it("renders a scroll hint when content overflows", () => {
+    render(
+      <SlideScrollContainer>
+        <div>tall content</div>
+      </SlideScrollContainer>,
+    );
+
+    const container = screen.getByTestId("slide-scroll-container");
+    stubOverflow(container, { scrollHeight: 900, clientHeight: 400 });
+
+    act(() => {
+      for (const observer of resizeObservers) {
+        observer.callback([], observer as unknown as ResizeObserver);
+      }
+    });
+
+    expect(screen.getByTestId("slide-scroll-hint")).toBeTruthy();
+    expect(screen.getByText("Scroll for more")).toBeTruthy();
+  });
+
+  it("hides the hint after scrolling", () => {
+    const metrics = {
+      scrollHeight: 900,
+      clientHeight: 400,
+      scrollTop: 0,
+    };
+
+    render(
+      <SlideScrollContainer>
+        <div>tall content</div>
+      </SlideScrollContainer>,
+    );
+
+    const container = screen.getByTestId("slide-scroll-container");
+    stubOverflow(container, metrics);
+
+    act(() => {
+      for (const observer of resizeObservers) {
+        observer.callback([], observer as unknown as ResizeObserver);
+      }
+    });
+    expect(screen.getByTestId("slide-scroll-hint")).toBeTruthy();
+
+    act(() => {
+      metrics.scrollTop = 50;
+      container.dispatchEvent(new Event("scroll"));
+    });
+
+    expect(screen.queryByTestId("slide-scroll-hint")).toBeNull();
+  });
+
+  it("does not show a hint when content fits", () => {
+    render(
+      <SlideScrollContainer>
+        <div>short content</div>
+      </SlideScrollContainer>,
+    );
+
+    const container = screen.getByTestId("slide-scroll-container");
+    stubOverflow(container, { scrollHeight: 200, clientHeight: 400 });
+
+    act(() => {
+      for (const observer of resizeObservers) {
+        observer.callback([], observer as unknown as ResizeObserver);
+      }
+    });
+
+    expect(screen.queryByTestId("slide-scroll-hint")).toBeNull();
+  });
+
+  it.each([
+    { scale: 0.5, fragmentOffset: 1000, expected: true },
+    { scale: 2, fragmentOffset: 500, expected: false },
+  ])(
+    "measures revealed content in canvas coordinates at scale $scale",
+    ({ scale, fragmentOffset, expected }) => {
+      render(
+        <SlideScrollContainer>
+          <div>revealed content</div>
+          <div className="fragment">unrevealed content</div>
+        </SlideScrollContainer>,
+      );
+
+      const container = screen.getByTestId("slide-scroll-container");
+      const fragment = container.querySelector<HTMLElement>(".fragment");
+      if (!fragment) {
+        throw new Error("Missing fragment");
+      }
+      stubOverflow(container, { scrollHeight: 1200, clientHeight: 720 });
+      Object.defineProperty(container, "offsetHeight", { value: 720 });
+      vi.spyOn(container, "getBoundingClientRect").mockReturnValue(
+        DOMRect.fromRect({ y: 100, height: 720 * scale }),
+      );
+      vi.spyOn(fragment, "getBoundingClientRect").mockReturnValue(
+        DOMRect.fromRect({ y: 100 + fragmentOffset * scale }),
+      );
+
+      act(() => {
+        for (const observer of resizeObservers) {
+          observer.callback([], observer as unknown as ResizeObserver);
+        }
+      });
+
+      expect(screen.queryByTestId("slide-scroll-hint") !== null).toBe(expected);
+    },
+  );
+});

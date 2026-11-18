@@ -1,0 +1,242 @@
+/* Copyright 2026 Marimo. All rights reserved. */
+
+import {
+  GridCellKind,
+  GridColumnIcon,
+  type GridSelection,
+} from "@glideapps/glide-data-grid";
+import type { DataType } from "@/core/kernel/messages";
+import { logNever } from "@/utils/assertNever";
+import { Logger } from "@/utils/Logger";
+import { normalizeBoolean } from "./column-types";
+import type {
+  ColumnEdit,
+  ColumnType,
+  EditorRow,
+  Edits,
+  ModifiedGridColumn,
+  PositionalEdit,
+  RemoveRowEdit,
+} from "./types";
+
+export function getColumnKind(fieldType: DataType): GridCellKind {
+  switch (fieldType) {
+    case "string":
+      return GridCellKind.Text;
+    case "number":
+      return GridCellKind.Number;
+    case "boolean":
+      return GridCellKind.Boolean;
+    case "integer":
+    case "date":
+    case "datetime":
+    case "time":
+    case "geometry":
+    case "unknown":
+      return GridCellKind.Text;
+    default:
+      logNever(fieldType);
+      return GridCellKind.Text;
+  }
+}
+
+export function getColumnHeaderIcon(fieldType: DataType): GridColumnIcon {
+  switch (fieldType) {
+    case "string":
+      return GridColumnIcon.HeaderString;
+    case "number":
+    case "integer":
+      return GridColumnIcon.HeaderNumber;
+    case "boolean":
+      return GridColumnIcon.HeaderBoolean;
+    case "date":
+    case "datetime":
+      return GridColumnIcon.HeaderDate;
+    case "time":
+      return GridColumnIcon.HeaderTime;
+    case "geometry":
+    case "unknown":
+      return GridColumnIcon.HeaderString;
+    default:
+      logNever(fieldType);
+      return GridColumnIcon.HeaderString;
+  }
+}
+
+export function isValidCellValue(
+  dataType: DataType | undefined,
+  value: unknown,
+  columnType?: ColumnType,
+): boolean {
+  if (Array.isArray(columnType)) {
+    return typeof value === "string" && columnType.includes(value);
+  }
+
+  switch (dataType) {
+    case "number":
+      return Number.isFinite(Number(value));
+    case "integer":
+      if (typeof value === "bigint") {
+        return true;
+      }
+      if (typeof value === "number") {
+        return Number.isFinite(value) && Number.isInteger(value);
+      }
+      if (typeof value === "string") {
+        const normalized = value.trim();
+        return /^[+-]?[0-9]+(?:\.0+)?$/u.test(normalized);
+      }
+      return false;
+    case "boolean":
+      return typeof value === "boolean";
+    case undefined:
+    case "string":
+    case "date":
+    case "datetime":
+    case "time":
+    case "geometry":
+    case "unknown":
+      return true;
+    default:
+      logNever(dataType);
+      return false;
+  }
+}
+
+export function isPositionalEdit(
+  edit: Edits["edits"][number],
+): edit is PositionalEdit {
+  return "rowIdx" in edit && "columnId" in edit && "value" in edit;
+}
+
+export function isRowEdit(edit: Edits["edits"][number]): edit is RemoveRowEdit {
+  return "rowIdx" in edit && "type" in edit;
+}
+
+export function isColumnEdit(edit: Edits["edits"][number]): edit is ColumnEdit {
+  return "columnIdx" in edit && "type" in edit;
+}
+
+export function pasteCells(options: {
+  selection: GridSelection;
+  data: EditorRow[];
+  columns: ModifiedGridColumn[];
+  editableColumns: string[] | "all";
+  onAddEdits: (edits: Edits["edits"]) => void;
+}) {
+  const { selection, data, onAddEdits, columns, editableColumns } = options;
+  if (!selection.current) {
+    return;
+  }
+
+  const { range } = selection.current;
+  const { x: startCol, y: startRow } = range;
+
+  navigator.clipboard
+    .readText()
+    .then((clipboardText) => {
+      if (!clipboardText.trim()) {
+        return;
+      }
+
+      const parsedData = clipboardText
+        .split("\n")
+        .filter((row) => row.trim())
+        .map((row) => row.split("\t"));
+
+      const edits: Edits["edits"] = [];
+      const editableColumnSet =
+        editableColumns === "all" ? null : new Set(editableColumns);
+
+      for (const [rowIndex, dataRow] of parsedData.entries()) {
+        const targetRowIdx = startRow + rowIndex;
+
+        if (targetRowIdx >= data.length) {
+          break;
+        }
+
+        for (const [colIndex, cellValue] of dataRow.entries()) {
+          const targetColIdx = startCol + colIndex;
+
+          if (targetColIdx >= columns.length) {
+            break;
+          }
+
+          const column = columns[targetColIdx];
+          const dataType = column.dataType;
+          const columnType = column.configuredType;
+          const editable =
+            editableColumnSet === null || editableColumnSet.has(column.title);
+
+          if (!editable) {
+            continue;
+          }
+
+          let convertedValue: unknown = cellValue;
+
+          if (
+            Array.isArray(columnType) &&
+            !isValidCellValue(dataType, cellValue, columnType)
+          ) {
+            continue;
+          }
+
+          switch (dataType) {
+            case "integer": {
+              const numValue = Number(cellValue);
+              if (!isValidCellValue(dataType, cellValue, columnType)) {
+                continue;
+              }
+              convertedValue = Number.isSafeInteger(numValue)
+                ? numValue
+                : cellValue.trim();
+              break;
+            }
+            case "number": {
+              const numValue = Number(cellValue);
+              if (!isValidCellValue(dataType, numValue, columnType)) {
+                continue;
+              }
+              convertedValue = numValue;
+              break;
+            }
+            case "boolean":
+              if (column.configuredType !== "boolean") {
+                convertedValue =
+                  cellValue.toLowerCase() === "true" || cellValue === "1";
+                break;
+              }
+              try {
+                convertedValue = normalizeBoolean(cellValue, column.title);
+              } catch {
+                continue;
+              }
+              break;
+            case "string":
+            case "date":
+            case "datetime":
+            case "time":
+            case "geometry":
+            case "unknown":
+              break;
+            default:
+              logNever(dataType);
+              continue;
+          }
+
+          edits.push({
+            rowIdx: targetRowIdx,
+            columnId: column.title,
+            value: convertedValue,
+          });
+        }
+      }
+
+      if (edits.length > 0) {
+        onAddEdits(edits);
+      }
+    })
+    .catch((error) => {
+      Logger.error("Failed to read clipboard data", error);
+    });
+}

@@ -1,0 +1,107 @@
+# Copyright 2026 Marimo. All rights reserved.
+"""Specification of a cell's visual output"""
+
+from __future__ import annotations
+
+import time
+from enum import Enum
+from typing import Any, Literal
+
+import msgspec
+
+from marimo._messaging.errors import Error
+from marimo._messaging.mimetypes import ConsoleMimeType, KnownMimeType
+from marimo._messaging.msgspec_encoder import asdict
+
+
+class CellChannel(str, Enum):
+    """The channel of a cell's output."""
+
+    STDOUT = "stdout"
+    STDERR = "stderr"
+    STDIN = "stdin"
+    PDB = "pdb"
+    OUTPUT = "output"
+    MARIMO_ERROR = "marimo-error"
+    MEDIA = "media"
+
+    def __repr__(self) -> str:
+        return self.value
+
+
+class CellOutput(msgspec.Struct):
+    # descriptive name about the kind of output: e.g., stdout, stderr, ...
+    channel: CellChannel
+    mimetype: KnownMimeType
+    data: str | list[Error] | dict[str, Any]
+    timestamp: float = msgspec.field(default_factory=lambda: time.time())
+    # Source code associated with this output, omitted when unavailable.
+    code: str | msgspec.UnsetType = msgspec.UNSET
+    input_id: str | msgspec.UnsetType = msgspec.UNSET
+    # Traceback MIME data can be plain text in code-mode requests.
+    traceback_format: Literal["text", "html"] | msgspec.UnsetType = (
+        msgspec.UNSET
+    )
+
+    def __repr__(self) -> str:
+        return f"CellOutput(channel={self.channel}, mimetype={self.mimetype}, timestamp={self.timestamp})"
+
+    def asdict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @staticmethod
+    def stdout(
+        data: str, mimetype: ConsoleMimeType = "text/plain"
+    ) -> CellOutput:
+        return CellOutput(
+            channel=CellChannel.STDOUT,
+            mimetype=mimetype,
+            data=data,
+        )
+
+    @staticmethod
+    def stderr(
+        data: str,
+        mimetype: ConsoleMimeType = "text/plain",
+        *,
+        code: str | msgspec.UnsetType = msgspec.UNSET,
+    ) -> CellOutput:
+        return CellOutput(
+            channel=CellChannel.STDERR,
+            mimetype=mimetype,
+            data=data,
+            code=code,
+        )
+
+    @staticmethod
+    def stdin(
+        data: str,
+        password: bool = False,
+        *,
+        input_id: str | msgspec.UnsetType = msgspec.UNSET,
+    ) -> CellOutput:
+        return CellOutput(
+            channel=CellChannel.STDIN,
+            mimetype="text/password" if password else "text/plain",
+            data=data,
+            input_id=input_id,
+        )
+
+    @staticmethod
+    def empty() -> CellOutput:
+        return CellOutput(
+            channel=CellChannel.OUTPUT,
+            mimetype="text/plain",
+            data="",
+        )
+
+    @staticmethod
+    def errors(
+        data: list[Error], *, code: str | msgspec.UnsetType = msgspec.UNSET
+    ) -> CellOutput:
+        return CellOutput(
+            channel=CellChannel.MARIMO_ERROR,
+            mimetype="application/vnd.marimo+error",
+            data=data,
+            code=code,
+        )

@@ -1,0 +1,134 @@
+/* Copyright 2026 Marimo. All rights reserved. */
+
+import type { JSX } from "react"; /* Copyright 2026 Marimo. All rights reserved. */
+import { useCellIds, useCellNames } from "@/core/cells/cells";
+import { useCellActions } from "@/core/cells/actions";
+import { type CellId, HTMLCellId, SCRATCH_CELL_ID } from "@/core/cells/ids";
+import { displayCellName } from "@/core/cells/names";
+import { scrollToCell } from "@/core/cells/scrollCellIntoView";
+import { goToCellLine } from "@/core/codemirror/go-to-definition/utils";
+import { useFilename } from "@/core/saving/filename";
+import { cn } from "@/utils/cn";
+import { Events } from "@/utils/events";
+import { Logger } from "../../../utils/Logger";
+import { focusCell } from "../navigation/focus-utils";
+
+interface Props {
+  cellId: CellId;
+  className?: string;
+  shouldScroll?: boolean;
+  skipScroll?: boolean;
+  onClick?: () => void;
+  formatCellName?: (name: string) => string;
+  variant?: "destructive" | "focus";
+}
+
+/* Component that adds a link to a cell, with styling. */
+export const CellLink = (props: Props): JSX.Element => {
+  const { className, cellId, variant, onClick, formatCellName, skipScroll } =
+    props;
+  const cellName = useCellNames()[cellId] ?? "";
+  const cellIndex = useCellIds().indexOf(cellId);
+  const { showCellIfHidden } = useCellActions();
+  const formatName = formatCellName ?? ((name: string) => name);
+
+  return (
+    // Reveal hidden cells before scrolling and focusing the destination.
+    // react-doctor-disable-next-line react-doctor/no-prevent-default
+    <a
+      href={
+        cellId === SCRATCH_CELL_ID ? undefined : `#${HTMLCellId.create(cellId)}`
+      }
+      className={cn(
+        "inline-block cursor-pointer text-left text-link hover:underline focus-visible:outline focus-visible:outline-ring",
+        className,
+      )}
+      onClick={(e) => {
+        if (e.defaultPrevented || e.button !== 0 || Events.hasModifier(e)) {
+          return;
+        }
+        // Scratch causes a crash since scratch is not registered like a
+        // normal cell.
+        if (cellId === SCRATCH_CELL_ID) {
+          return false;
+        }
+        showCellIfHidden({ cellId });
+        e.stopPropagation();
+        e.preventDefault();
+        requestAnimationFrame(() => {
+          const succeeded = scrollAndHighlightCell(cellId, variant, skipScroll);
+          if (succeeded) {
+            focusCell(cellId, { preventScroll: true });
+            onClick?.();
+          }
+        });
+      }}
+    >
+      {formatName(displayCellName(cellName, cellIndex))}
+    </a>
+  );
+};
+
+/* Component that adds a link to a cell, for use in a MarimoError. */
+export const CellLinkError = (
+  props: Pick<Props, "className" | "cellId">,
+): JSX.Element => {
+  return <CellLink {...props} variant={"destructive"} />;
+};
+
+/* Component that adds a link to a cell, for use in tracebacks. */
+export const CellLinkTraceback = ({
+  cellId,
+  lineNumber,
+}: {
+  cellId: CellId;
+  lineNumber: number;
+}): JSX.Element => {
+  const filename = useFilename();
+  return (
+    <CellLink
+      cellId={cellId}
+      onClick={() => goToCellLine(cellId, lineNumber)}
+      skipScroll={true}
+      variant={"destructive"}
+      className="traceback-cell-link"
+      formatCellName={(name: string) =>
+        cellId === SCRATCH_CELL_ID
+          ? "scratch"
+          : `marimo://${filename || "untitled"}#cell=${name}`
+      }
+    />
+  );
+};
+
+export function scrollAndHighlightCell(
+  cellId: CellId,
+  variant?: "destructive" | "focus",
+  skipScroll?: boolean,
+): boolean {
+  const cellHtmlId = HTMLCellId.create(cellId);
+  const cell = skipScroll
+    ? document.getElementById(cellHtmlId)
+    : scrollToCell(cellId);
+  const isCellErrored = cell?.classList.contains("has-error");
+
+  if (cell === null) {
+    Logger.error(`Cell ${cellHtmlId} not found on page.`);
+    return false;
+  }
+
+  if (variant === "destructive" || (isCellErrored && variant === undefined)) {
+    cell.classList.add("error-outline");
+    setTimeout(() => {
+      cell.classList.remove("error-outline");
+    }, 2000);
+  }
+  if (variant === "focus" || (!isCellErrored && variant === undefined)) {
+    cell.classList.add("focus-outline");
+    setTimeout(() => {
+      cell.classList.remove("focus-outline");
+    }, 2000);
+  }
+
+  return true;
+}

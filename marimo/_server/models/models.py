@@ -1,0 +1,301 @@
+# Copyright 2026 Marimo. All rights reserved.
+from __future__ import annotations
+
+from typing import Any, Literal
+
+import msgspec
+
+from marimo._config.config import PartialMarimoConfig
+from marimo._runtime.commands import (
+    ClearCacheCommand,
+    CodeCompletionCommand,
+    DebugCellCommand,
+    DiscoverDataSourcesCommand,
+    ExecuteScratchpadCommand,
+    GetCacheInfoCommand,
+    InstallPackagesCommand,
+    InvokeFunctionCommand,
+    ListDataSourceConnectionCommand,
+    ListSecretKeysCommand,
+    ListSQLSchemasCommand,
+    ListSQLTablesCommand,
+    ModelCommand,
+    PreviewDatasetColumnCommand,
+    PreviewSQLTableCommand,
+    SetBreakpointsCommand,
+    StorageDownloadCommand,
+    StorageListEntriesCommand,
+    UpdateUIElementCommand,
+    UpdateUserConfigCommand,
+    ValidateSQLCommand,
+)
+from marimo._types.ids import CellId_t
+
+
+class ListSecretKeysRequest(ListSecretKeysCommand, tag=False):
+    def as_command(self) -> ListSecretKeysCommand:
+        return ListSecretKeysCommand(request_id=self.request_id)
+
+
+class DiscoverDataSourcesRequest(DiscoverDataSourcesCommand, tag=False):
+    def as_command(self) -> DiscoverDataSourcesCommand:
+        return DiscoverDataSourcesCommand(request_id=self.request_id)
+
+
+class ClearCacheRequest(ClearCacheCommand, tag=False):
+    def as_command(self) -> ClearCacheCommand:
+        return ClearCacheCommand()
+
+
+class GetCacheInfoRequest(GetCacheInfoCommand, tag=False):
+    def as_command(self) -> GetCacheInfoCommand:
+        return GetCacheInfoCommand()
+
+
+class DebugCellRequest(DebugCellCommand, tag=False):
+    def as_command(self) -> DebugCellCommand:
+        return DebugCellCommand(cell_id=self.cell_id, request=self.request)
+
+
+class SetBreakpointsRequest(SetBreakpointsCommand, tag=False):
+    def as_command(self) -> SetBreakpointsCommand:
+        return SetBreakpointsCommand(
+            breakpoints=self.breakpoints, request=self.request
+        )
+
+
+class ExecuteScratchpadRequest(ExecuteScratchpadCommand, tag=False):
+    def as_command(self) -> ExecuteScratchpadCommand:
+        return ExecuteScratchpadCommand(code=self.code, request=self.request)
+
+
+class InvokeFunctionRequest(InvokeFunctionCommand, tag=False):
+    def as_command(self) -> InvokeFunctionCommand:
+        return InvokeFunctionCommand(
+            function_call_id=self.function_call_id,
+            namespace=self.namespace,
+            function_name=self.function_name,
+            args=self.args,
+        )
+
+
+class UpdateUIElementRequest(UpdateUIElementCommand, tag=False):
+    def as_command(self) -> UpdateUIElementCommand:
+        return UpdateUIElementCommand(
+            object_ids=self.object_ids,
+            values=self.values,
+            request=self.request,
+            token=self.token,
+        )
+
+
+class ModelRequest(ModelCommand, tag=False):
+    def as_command(self) -> ModelCommand:
+        return ModelCommand(
+            model_id=self.model_id,
+            message=self.message,
+            buffers=self.buffers,
+        )
+
+
+class ListDataSourceConnectionRequest(
+    ListDataSourceConnectionCommand, tag=False
+):
+    def as_command(self) -> ListDataSourceConnectionCommand:
+        return ListDataSourceConnectionCommand(engine=self.engine)
+
+
+class ListSQLTablesRequest(ListSQLTablesCommand, tag=False):
+    def as_command(self) -> ListSQLTablesCommand:
+        return ListSQLTablesCommand(
+            request_id=self.request_id,
+            engine=self.engine,
+            database=self.database,
+            schema=self.schema,
+            schema_path=self.schema_path,
+        )
+
+
+class ListSQLSchemasRequest(ListSQLSchemasCommand, tag=False):
+    def as_command(self) -> ListSQLSchemasCommand:
+        return ListSQLSchemasCommand(
+            request_id=self.request_id,
+            engine=self.engine,
+            database=self.database,
+            schema_path=self.schema_path,
+        )
+
+
+class PreviewDatasetColumnRequest(PreviewDatasetColumnCommand, tag=False):
+    def as_command(self) -> PreviewDatasetColumnCommand:
+        return PreviewDatasetColumnCommand(
+            source_type=self.source_type,
+            source=self.source,
+            table_name=self.table_name,
+            column_name=self.column_name,
+            fully_qualified_table_name=self.fully_qualified_table_name,
+        )
+
+
+class PreviewSQLTableRequest(PreviewSQLTableCommand, tag=False):
+    def as_command(self) -> PreviewSQLTableCommand:
+        return PreviewSQLTableCommand(
+            request_id=self.request_id,
+            engine=self.engine,
+            database=self.database,
+            schema=self.schema,
+            table_name=self.table_name,
+            schema_path=self.schema_path,
+        )
+
+
+class ValidateSQLRequest(ValidateSQLCommand, tag=False):
+    def as_command(self) -> ValidateSQLCommand:
+        return ValidateSQLCommand(
+            query=self.query,
+            only_parse=self.only_parse,
+            engine=self.engine,
+            dialect=self.dialect,
+            request_id=self.request_id,
+        )
+
+
+class StorageListEntriesRequest(StorageListEntriesCommand, tag=False):
+    def as_command(self) -> StorageListEntriesCommand:
+        return StorageListEntriesCommand(
+            request_id=self.request_id,
+            namespace=self.namespace,
+            limit=self.limit,
+            prefix=self.prefix,
+            page_token=self.page_token,
+        )
+
+
+class StorageDownloadRequest(StorageDownloadCommand, tag=False):
+    def as_command(self) -> StorageDownloadCommand:
+        return StorageDownloadCommand(
+            request_id=self.request_id,
+            namespace=self.namespace,
+            path=self.path,
+            preview=self.preview,
+        )
+
+
+class UpdateUserConfigRequest(msgspec.Struct):
+    config: PartialMarimoConfig
+
+    def as_command(self) -> UpdateUserConfigCommand:
+        return UpdateUserConfigCommand(config=self.config)
+
+
+class InstallPackagesRequest(InstallPackagesCommand, tag=False):
+    def as_command(self) -> InstallPackagesCommand:
+        return InstallPackagesCommand(
+            manager=self.manager, versions=self.versions, source=self.source
+        )
+
+
+class CodeCompletionRequest(CodeCompletionCommand, tag=False):
+    def as_command(self) -> CodeCompletionCommand:
+        return CodeCompletionCommand(
+            id=self.id,
+            document=self.document,
+            cell_id=self.cell_id,
+        )
+
+
+class BaseResponse(msgspec.Struct, rename="camel"):
+    success: bool
+
+
+class SuccessResponse(BaseResponse):
+    success: bool = True
+
+
+class ErrorResponse(BaseResponse):
+    success: bool = False
+    message: str | None = None
+
+
+class KernelStatusResponse(msgspec.Struct, rename="camel"):
+    # `running`: at least one cell is queued or running.
+    # `idle`: the kernel is alive but not executing.
+    # `stopped`: the kernel process is not running (dead or not started).
+    state: Literal["running", "idle", "stopped"]
+
+
+class FormatCellsRequest(msgspec.Struct, rename="camel"):
+    codes: dict[CellId_t, str]
+    line_length: int
+
+
+class FormatResponse(msgspec.Struct, rename="camel"):
+    codes: dict[CellId_t, str]
+
+
+class ReadCodeResponse(msgspec.Struct, rename="camel"):
+    contents: str
+
+
+class RenameNotebookRequest(msgspec.Struct, rename="camel"):
+    filename: str
+
+
+class FocusCellRequest(msgspec.Struct, rename="camel"):
+    cell_id: CellId_t
+
+
+class SaveLayoutRequest(msgspec.Struct, rename="camel"):
+    """The notebook's layout, written beside it; `None` removes it."""
+
+    layout: dict[str, Any] | None = None
+
+
+class CopyNotebookRequest(msgspec.Struct, rename="camel"):
+    # path to app
+    source: str
+    destination: str
+
+
+class SaveAppConfigurationRequest(msgspec.Struct, rename="camel"):
+    # partial app config
+    config: dict[str, Any]
+
+
+class SaveUserConfigurationRequest(msgspec.Struct, rename="camel"):
+    # deep partial user configuration; keys with value `None` are removed
+    # from the on-disk merged config (None-as-delete)
+    config: dict[str, Any]
+
+
+class InvokeAiToolRequest(msgspec.Struct, rename="camel"):
+    tool_name: str
+    arguments: dict[str, Any]
+
+
+class InvokeAiToolResponse(BaseResponse):
+    tool_name: str
+    result: Any
+    error: str | None = None
+
+
+class ProviderModel(msgspec.Struct, rename="camel"):
+    id: str
+    name: str
+
+
+class ProviderModelsResponse(msgspec.Struct, rename="camel"):
+    models: list[ProviderModel]
+
+
+class MCPStatusResponse(msgspec.Struct, rename="camel"):
+    status: Literal["ok", "partial", "error"]
+    error: str | None = None
+    servers: dict[
+        str, Literal["pending", "connected", "disconnected", "failed"]
+    ] = {}  # server_name -> status
+
+
+class MCPRefreshResponse(BaseResponse):
+    error: str | None = None
+    servers: dict[str, bool] = {}  # server_name -> connected

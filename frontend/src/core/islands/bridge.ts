@@ -1,0 +1,486 @@
+/* Copyright 2026 Marimo. All rights reserved. */
+/* oxlint-disable typescript/no-explicit-any */
+
+import { NotebookClient, type NotebookTransport } from "@marimo-team/client";
+import { getWorkerRPC } from "@/core/wasm/rpc";
+import { Deferred } from "@/utils/Deferred";
+import { throwNotImplemented } from "@/utils/functions";
+import { Logger } from "@/utils/Logger";
+import { jsonParseWithSpecialChar } from "@/utils/json/json-parser";
+import { generateUUID } from "@/utils/uuid";
+import { initialNotebookState, notebookAtom } from "../cells/cells";
+import type { NotebookBackend } from "../notebook/replica";
+import type { ClientCommand, NotificationMessage } from "../kernel/messages";
+import type { EditRequests, RunRequests } from "../network/types";
+import { store as defaultStore } from "../state/jotai";
+import { getMarimoExportContext } from "../static/export-context";
+import { createMarimoFile, parseMarimoIslandApps } from "./parse";
+import { islandsInitializedAtom, islandsPendingInitialRunsAtom } from "./state";
+import type { WorkerSchema } from "./worker/worker";
+import type { WorkerFactory } from "./worker-factory";
+import { DefaultWorkerFactory } from "./worker-factory";
+
+/**
+ * Configuration for creating an IslandsPyodideBridge
+ */
+export interface IslandsBridgeConfig {
+  /**
+   * Optional worker factory for creating workers (for testing)
+   */
+  workerFactory?: WorkerFactory;
+
+  /**
+   * Optional Jotai store (for testing)
+   */
+  store?: typeof defaultStore;
+
+  /**
+   * Optional root element for parsing islands (for testing)
+   */
+  root?: Document | Element;
+}
+
+interface AppSession {
+  appId: string;
+  code?: string;
+  sessionGeneration: number;
+}
+
+/**
+ * Bridge between the browser and Pyodide worker for islands mode.
+ *
+ * This class manages communication with a Web Worker that runs Python code
+ * via Pyodide, enabling interactive marimo islands.
+ *
+ * @example
+ * ```ts
+ * const bridge = new IslandsPyodideBridge();
+ * bridge.consumeNotifications((notification) => console.log(notification.op));
+ * await bridge.initializeApps();
+ * ```
+ */
+export class IslandsPyodideBridge implements RunRequests, EditRequests {
+  private rpc: ReturnType<typeof getWorkerRPC<WorkerSchema>>;
+  private notificationConsumer:
+    | ((notification: NotificationMessage, sessionGeneration: number) => void)
+    | undefined;
+  private readonly store: typeof defaultStore;
+  private readonly root: Document | Element;
+  private session: AppSession | undefined;
+  private sessionReady = new Deferred<AppSession>();
+  private nextSessionGeneration = 0;
+  private readonly activeSessionGenerations = new Set<number>();
+  private appTransition = Promise.resolve();
+  private workerReady = new Deferred<void>();
+  /** Where the managed session's host events go while a replica follows them. */
+  private stream: Parameters<NotebookTransport>[1] | undefined;
+
+  public initialized = new Deferred<void>();
+
+  /**
+   * The managed session's host stream, for a replica to follow. Replacing
+   * or stopping the session resets the stream, and the next session's
+   * snapshot follows.
+   */
+  public readonly notebookBackend: NotebookBackend = {
+    transport: ({ signal }, handlers) =>
+      new Promise((resolve) => {
+        this.stream = handlers;
+        handlers.open();
+        signal.addEventListener(
+          "abort",
+          () => {
+            if (this.stream === handlers) {
+              this.stream = undefined;
+            }
+            resolve();
+          },
+          { once: true },
+        );
+      }),
+    notebook: (notebookId) => {
+      const session = this.session;
+      if (session === undefined) {
+        throw new Error("No island session is active");
+      }
+      const { appId, sessionGeneration } = session;
+      return NotebookClient.unstable_over(
+        (call) =>
+          this.rpc.proxy.request.notebookCall({
+            appId,
+            sessionGeneration,
+            call,
+          }),
+        { notebookId },
+      );
+    },
+  };
+
+  public constructor(config: IslandsBridgeConfig = {}) {
+    this.store = config.store || defaultStore;
+    this.root = config.root || document;
+
+    try {
+      const factory = config.workerFactory || new DefaultWorkerFactory();
+      const worker = factory.create();
+      this.rpc = getWorkerRPC<WorkerSchema>(worker);
+      this.setupMessageListeners();
+    } catch (error) {
+      Logger.error("Failed to initialize IslandsPyodideBridge:", error);
+      this.initialized.reject(error);
+      throw error;
+    }
+  }
+
+  /**
+   * Sets up message listeners for worker communication
+   */
+  private setupMessageListeners(): void {
+    this.rpc.addMessageListener("ready", () => {
+      this.workerReady.resolve();
+    });
+
+    this.rpc.addMessageListener("initialized", () => {
+      this.store.set(islandsInitializedAtom, true);
+      this.initialized.resolve();
+    });
+
+    this.rpc.addMessageListener(
+      "initializedError",
+      ({ error }: { error: string }) => {
+        Logger.error("Islands initialization error:", error);
+        this.store.set(islandsInitializedAtom, error);
+        this.initialized.reject(new Error(error));
+      },
+    );
+
+    this.rpc.addMessageListener(
+      "notebookEvent",
+      ({ event, sessionGeneration }) => {
+        // A stopped session can still have events in transit after the next
+        // app takes ownership of the shared frontend state.
+        if (!this.activeSessionGenerations.has(sessionGeneration)) {
+          return;
+        }
+        const frame = jsonParseWithSpecialChar(event) as {
+          event: string;
+          data: { marimo?: NotificationMessage };
+        };
+        if (frame.event === "marimo") {
+          if (frame.data.marimo) {
+            this.notificationConsumer?.(frame.data.marimo, sessionGeneration);
+          }
+          return;
+        }
+        // The replica follows the managed session's host document.
+        if (sessionGeneration === this.session?.sessionGeneration) {
+          this.stream?.message(frame);
+        }
+      },
+    );
+  }
+
+  /** The managed session is gone, so its stream starts over. */
+  private resetNotebookStream(): void {
+    this.stream?.message({ event: "reset", data: {} });
+  }
+
+  public async initializeApps(): Promise<void> {
+    await this.enqueueAppTransition(async () => {
+      await this.workerReady.promise;
+      await this.startApps();
+    });
+  }
+
+  private async startApps(): Promise<void> {
+    const apps = parseMarimoIslandApps(this.root, { materialize: false });
+    const managesSingleApp = apps.length === 1;
+    Logger.debug(
+      `Starting sessions for ${apps.length} app(s):`,
+      apps.map((a) => `${a.id} (${a.cells.length} cells)`),
+    );
+    // Payload-backed apps already carry the exact runtime cells and order. The
+    // full-notebook export context may describe a different source and would
+    // override the payload contract for single-app pages.
+    const exportContext =
+      apps.length === 1 && !apps[0]?.payloadBacked
+        ? getMarimoExportContext()
+        : undefined;
+    const notebookCode = exportContext?.notebookCode;
+    const singleApp = managesSingleApp ? apps[0] : undefined;
+    const singleAppFile = singleApp
+      ? notebookCode || createMarimoFile(singleApp)
+      : undefined;
+    if (
+      singleApp &&
+      this.session?.appId === singleApp.id &&
+      this.session.code === singleAppFile
+    ) {
+      parseMarimoIslandApps(this.root);
+      return;
+    }
+    if (apps.length > 0) {
+      this.activeSessionGenerations.clear();
+      this.store.set(
+        islandsPendingInitialRunsAtom,
+        new Set(apps.map((_, index) => this.nextSessionGeneration + index + 1)),
+      );
+    }
+    parseMarimoIslandApps(this.root);
+    for (const app of apps) {
+      const file = singleAppFile || createMarimoFile(app);
+      Logger.debug(`App ${app.id} marimo file:\n`, file);
+      const request = {
+        code: file,
+        appId: app.id,
+        sessionGeneration: ++this.nextSessionGeneration,
+      };
+      const previousSession = this.session;
+      const replacesSession = managesSingleApp && previousSession !== undefined;
+      this.activeSessionGenerations.add(request.sessionGeneration);
+      if (replacesSession) {
+        this.resetNotebookStream();
+        this.store.set(notebookAtom, initialNotebookState());
+      }
+      if (managesSingleApp || !previousSession) {
+        if (managesSingleApp && this.sessionReady.status !== "pending") {
+          this.sessionReady = new Deferred<AppSession>();
+        }
+        this.session = {
+          ...request,
+          code: managesSingleApp ? file : undefined,
+        };
+      }
+      const operation = replacesSession
+        ? this.rpc.proxy.request.replaceSession(request)
+        : this.startSession(request);
+      try {
+        await operation;
+        if (this.sessionReady.status === "pending" && this.session) {
+          this.sessionReady.resolve(this.session);
+        }
+      } catch (error) {
+        this.activeSessionGenerations.delete(request.sessionGeneration);
+        if (this.session?.sessionGeneration === request.sessionGeneration) {
+          this.session = previousSession;
+          if (previousSession) {
+            this.activeSessionGenerations.add(
+              previousSession.sessionGeneration,
+            );
+          }
+        }
+        Logger.error(`Failed to start session for app ${app.id}:`, error);
+        if (managesSingleApp) {
+          throw error;
+        }
+      }
+    }
+  }
+
+  public async stopSession(appId?: string): Promise<void> {
+    await this.enqueueAppTransition(async () => {
+      const session = this.session;
+      if (session?.code === undefined || (appId && session.appId !== appId)) {
+        return;
+      }
+      this.activeSessionGenerations.delete(session.sessionGeneration);
+      await this.rpc.proxy.request.stopSession({
+        appId: session.appId,
+        sessionGeneration: session.sessionGeneration,
+      });
+      this.store.set(islandsPendingInitialRunsAtom, null);
+      this.session = undefined;
+      this.sessionReady = new Deferred<AppSession>();
+      this.resetNotebookStream();
+      this.store.set(notebookAtom, initialNotebookState());
+    });
+  }
+
+  private enqueueAppTransition(operation: () => Promise<void>): Promise<void> {
+    const result = this.appTransition.then(operation);
+    this.appTransition = result.catch(() => undefined);
+    return result;
+  }
+
+  /**
+   * Starts a new Python session for an app
+   */
+  public async startSession(opts: {
+    code: string;
+    appId: string;
+    sessionGeneration: number;
+  }): Promise<void> {
+    await this.rpc.proxy.request.startSession(opts);
+  }
+
+  /** Receive each running session's marimo notifications. */
+  public consumeNotifications(
+    consumer: (
+      notification: NotificationMessage,
+      sessionGeneration: number,
+    ) => void,
+  ): void {
+    this.notificationConsumer = consumer;
+  }
+
+  // ============================================================================
+  // RunRequests Implementation
+  // ============================================================================
+
+  public sendComponentValues: RunRequests["sendComponentValues"] = async (
+    request,
+  ): Promise<null> => {
+    await this.putControlRequest({
+      type: "update-ui-element",
+      ...request,
+      token: generateUUID(),
+    });
+    return null;
+  };
+
+  public sendInstantiate: RunRequests["sendInstantiate"] =
+    async (): Promise<null> => {
+      return null;
+    };
+
+  public sendFunctionRequest: RunRequests["sendFunctionRequest"] = async (
+    request,
+  ): Promise<null> => {
+    await this.putControlRequest({
+      type: "invoke-function",
+      ...request,
+    });
+    return null;
+  };
+
+  public sendModelValue: RunRequests["sendModelValue"] = async (request) => {
+    await this.putControlRequest({
+      type: "model",
+      ...request,
+    });
+    return null;
+  };
+
+  // ============================================================================
+  // EditRequests Implementation
+  // ============================================================================
+
+  // ============================================================================
+  // Not Implemented (Read-Only Mode)
+  // ============================================================================
+
+  public getUsageStats = throwNotImplemented;
+  public getEnvironmentInfo = throwNotImplemented;
+  public sendRename = throwNotImplemented;
+  public saveLayout = throwNotImplemented;
+  public sendCopy = throwNotImplemented;
+  public sendRunScratchpad = throwNotImplemented;
+  public sendShutdown = throwNotImplemented;
+  public sendFormat = throwNotImplemented;
+  public sendInstallMissingPackages = throwNotImplemented;
+  public sendCodeCompletionRequest = throwNotImplemented;
+  public saveUserConfig = throwNotImplemented;
+  public saveAppConfig = throwNotImplemented;
+  public sendRestart = throwNotImplemented;
+  public readCode = throwNotImplemented;
+  public readSnippets = throwNotImplemented;
+  public previewDatasetColumn = throwNotImplemented;
+  public previewSQLTable = throwNotImplemented;
+  public previewSQLTableList = throwNotImplemented;
+  public previewSQLSchemaList = throwNotImplemented;
+  public previewDataSourceConnection = throwNotImplemented;
+  public discoverDataSources = throwNotImplemented;
+  public validateSQL = throwNotImplemented;
+  public openFile = throwNotImplemented;
+  public getFileRoots = throwNotImplemented;
+  public sendListFiles = throwNotImplemented;
+  public sendSearchFiles = throwNotImplemented;
+  public sendPdb = throwNotImplemented;
+  public sendSetBreakpoints = throwNotImplemented;
+  public sendCreateFileOrFolder = throwNotImplemented;
+  public sendDeleteFileOrFolder = throwNotImplemented;
+  public sendCopyFileOrFolder = throwNotImplemented;
+  public sendRenameFileOrFolder = throwNotImplemented;
+  public sendUpdateFile = throwNotImplemented;
+  public sendFileDetails = throwNotImplemented;
+  public openTutorial = throwNotImplemented;
+  public getExportAvailability = throwNotImplemented;
+  public installExportRequirements = throwNotImplemented;
+  public exportAsHTML = throwNotImplemented;
+  public exportAsIPYNB = throwNotImplemented;
+  public exportAsMarkdown = throwNotImplemented;
+  public exportAsScript = throwNotImplemented;
+  public exportAsPDF = throwNotImplemented;
+  public autoExportAsHTML = throwNotImplemented;
+  public autoExportAsMarkdown = throwNotImplemented;
+  public autoExportAsIPYNB = throwNotImplemented;
+  public updateCellOutputs = throwNotImplemented;
+  public addPackage = throwNotImplemented;
+  public removePackage = throwNotImplemented;
+  public getPackageList = throwNotImplemented;
+  public getSandbox = throwNotImplemented;
+  public updateManifest = throwNotImplemented;
+  public syncSandbox = throwNotImplemented;
+  public getDependencyTree = throwNotImplemented;
+  public getRecentFiles = throwNotImplemented;
+  public getWorkspaceFiles = throwNotImplemented;
+  public getRunningNotebooks = throwNotImplemented;
+  public shutdownSession = throwNotImplemented;
+  public listSecretKeys = throwNotImplemented;
+  public writeSecret = throwNotImplemented;
+  public invokeAiTool = throwNotImplemented;
+  public clearCache = throwNotImplemented;
+  public getCacheInfo = throwNotImplemented;
+  public listStorageEntries = throwNotImplemented;
+  public downloadStorage = throwNotImplemented;
+
+  // The kernel uses msgspec to parse control requests, which requires a 'type'
+  // field for discriminated union deserialization.
+  private async putControlRequest(
+    operation: ClientCommand,
+    session?: AppSession,
+  ): Promise<void> {
+    session ??= await this.getActiveSession();
+    await this.rpc.proxy.request.bridge({
+      appId: session.appId,
+      functionName: "put_control_request",
+      payload: operation,
+      sessionGeneration: session.sessionGeneration,
+    });
+  }
+
+  private async getActiveSession(): Promise<AppSession> {
+    const transition = this.appTransition;
+    const session = this.session;
+    const ready = this.sessionReady;
+    await transition;
+    return session ?? ready.promise;
+  }
+
+  /**
+   * Cleans up resources (for testing)
+   */
+  public destroy(): void {
+    // Future: terminate worker if we own it
+  }
+}
+
+/**
+ * Global singleton instance.
+ * Use `new IslandsPyodideBridge(config)` in tests for better isolation.
+ */
+let globalBridgeInstance: IslandsPyodideBridge | null = null;
+
+export function getGlobalBridge(): IslandsPyodideBridge {
+  if (!globalBridgeInstance) {
+    globalBridgeInstance = new IslandsPyodideBridge();
+  }
+  return globalBridgeInstance;
+}
+
+/**
+ * Resets the global bridge instance (for testing)
+ */
+export function resetGlobalBridge(): void {
+  globalBridgeInstance = null;
+}

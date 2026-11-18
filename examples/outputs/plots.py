@@ -1,0 +1,85 @@
+# /// script
+# requires-python = ">=3.12"
+# dependencies = [
+#     "marimo",
+#     "matplotlib==3.10.9",
+#     "numpy==2.2.4",
+# ]
+# ///
+
+import marimo
+
+__generated_with = "0.25.2"
+app = marimo.App()
+
+
+@app.cell
+def _():
+    import marimo as mo
+
+    return (mo,)
+
+
+@app.cell
+def _():
+    import matplotlib.pyplot as plt
+
+    return (plt,)
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md("""
+    Output a plot object, such as an axis or figure, to see the plot.
+    """)
+
+
+@app.cell
+def _(plt):
+    import numpy as np
+
+    x = np.linspace(0, 10)
+    plt.plot(x, x**2)
+    plt.gca()
+    return np, x
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md("""
+    Calling `show()` methods displays the plot in the console area, which can be
+    helpful for debugging because console outputs do not show up in the "app" preview.
+    """)
+
+
+@app.cell
+def _(plt, x: tuple):
+    plt.plot(x, x**3)
+    plt.show()
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md("""
+    Wrap an `Axes` in `mo.ui.matplotlib` to enable reactive selections.
+    Click-drag for box selection, shift-drag for lasso selection.
+    """)
+
+
+@app.cell
+def _(mo, np, plt):
+    _x = np.random.randn(200)
+    _y = np.random.randn(200)
+    plt.scatter(_x, _y)
+    scatter_fig = mo.ui.matplotlib(plt.gca())
+    scatter_fig
+    return (scatter_fig,)
+
+
+@app.cell
+def _(scatter_fig):
+    scatter_fig.value
+
+
+if __name__ == "__main__":
+    app.run()

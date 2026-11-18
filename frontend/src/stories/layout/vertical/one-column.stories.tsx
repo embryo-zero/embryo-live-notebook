@@ -1,0 +1,202 @@
+/* Copyright 2026 Marimo. All rights reserved. */
+
+import type { Meta } from "@storybook/react-vite";
+import { createStore, Provider } from "jotai";
+import { createRef } from "react";
+import { mockDocumentModel } from "@/__mocks__/document";
+import { cellId } from "@/__tests__/branded";
+import { type NotebookState, notebookAtom } from "@/core/cells/cells";
+import { createCellRuntimeState } from "@/core/cells/types";
+import { defaultUserConfig, parseAppConfig } from "@/core/config/config-schema";
+import { showCodeInRunModeAtom } from "@/core/meta/state";
+import { DocumentProvider } from "@/core/notebook/document";
+import { connectionAtom } from "@/core/network/connection";
+import { requestClientAtom } from "@/core/network/requests";
+import { resolveRequestClient } from "@/core/network/resolve";
+import { ConnectionState } from "@/core/session/types";
+import { CellArray } from "../../../components/editor/renderers/cell-array";
+import { CellsRenderer } from "../../../components/editor/renderers/cells-renderer";
+import { TooltipProvider } from "../../../components/ui/tooltip";
+import type { CellId } from "../../../core/cells/ids";
+
+const createLongReprNotebook = (
+  cellId: CellId,
+  hideCode = false,
+): NotebookState => ({
+  cellData: {
+    [cellId]: {
+      id: cellId,
+      name: "_",
+      code: `class LongReprA:
+    def __repr__(self):
+        return "<dlt.Relation(dataset='" + ("jaffle_ingest_dataset_" * 80) + \\
+            "', destination='<dlt.destinations.duckdb(destination_type=\\'duckdb\\'," + \\
+            " credentials=\\'local_jaffle.duckdb\\')>')>"
+
+print('hello')
+LongReprA()`,
+      config: {
+        hide_code: hideCode,
+        disabled: false,
+        column: null,
+      },
+    },
+  },
+  cellIds: [cellId],
+  cellRuntime: {
+    [cellId]: createCellRuntimeState({
+      output: {
+        channel: "output",
+        data: "<dlt.Relation(dataset='jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_jaffle_ingest_dataset_', destination='<dlt.destinations.duckdb(destination_type='duckdb', credentials='local_jaffle.duckdb')>')>",
+        mimetype: "text/plain",
+        timestamp: 1_686_863_710,
+      },
+      consoleOutputs: [
+        {
+          channel: "stdout",
+          mimetype: "text/plain",
+          data: "hello",
+          timestamp: 1_686_863_705,
+        },
+      ],
+      debuggerActive: false,
+      outline: null,
+    }),
+  },
+  cellHandles: {
+    [cellId]: createRef(),
+  },
+  cellLogs: [],
+  history: [],
+  scrollKey: null,
+});
+
+export default {
+  title: "Layout/Vertical/One Column",
+  component: CellsRenderer,
+  args: {},
+} satisfies Meta<typeof CellsRenderer>;
+
+type W = Window & { __MARIMO_STATIC__?: { files: Record<string, unknown> } };
+
+const EditModeCodeShown = () => {
+  const cid = cellId("Hbol");
+  const notebook = createLongReprNotebook(cid);
+
+  const store = createStore();
+  store.set(notebookAtom, notebook);
+  store.set(connectionAtom, { state: ConnectionState.OPEN });
+  store.set(requestClientAtom, resolveRequestClient());
+  store.set(showCodeInRunModeAtom, true);
+  const { model } = mockDocumentModel(store, null);
+
+  return (
+    <Provider store={store}>
+      <DocumentProvider model={model}>
+        <TooltipProvider>
+          <CellsRenderer appConfig={parseAppConfig({})} mode="edit">
+            <CellArray
+              mode="edit"
+              userConfig={defaultUserConfig()}
+              appConfig={parseAppConfig({})}
+            />
+          </CellsRenderer>
+        </TooltipProvider>
+      </DocumentProvider>
+    </Provider>
+  );
+};
+
+const EditModeCodeHidden = () => {
+  const cid = cellId("Hbol");
+  const notebook = createLongReprNotebook(cid, true);
+
+  const store = createStore();
+  store.set(notebookAtom, notebook);
+  store.set(connectionAtom, { state: ConnectionState.OPEN });
+  store.set(requestClientAtom, resolveRequestClient());
+  store.set(showCodeInRunModeAtom, true);
+  const { model } = mockDocumentModel(store, null);
+
+  return (
+    <Provider store={store}>
+      <DocumentProvider model={model}>
+        <TooltipProvider>
+          <CellsRenderer appConfig={parseAppConfig({})} mode="edit">
+            <CellArray
+              mode="edit"
+              userConfig={defaultUserConfig()}
+              appConfig={parseAppConfig({})}
+            />
+          </CellsRenderer>
+        </TooltipProvider>
+      </DocumentProvider>
+    </Provider>
+  );
+};
+
+const ReadModeCodeShown = () => {
+  const cid = cellId("Hbol");
+  const notebook = createLongReprNotebook(cid);
+
+  const store = createStore();
+  store.set(notebookAtom, notebook);
+  store.set(connectionAtom, { state: ConnectionState.OPEN });
+  store.set(requestClientAtom, resolveRequestClient());
+  store.set(showCodeInRunModeAtom, true);
+
+  return (
+    <Provider store={store}>
+      <TooltipProvider>
+        <CellsRenderer appConfig={parseAppConfig({})} mode="read" />
+      </TooltipProvider>
+    </Provider>
+  );
+};
+
+const ReadModeCodeHidden = () => {
+  const cid = cellId("Hbol");
+  const notebook = createLongReprNotebook(cid);
+
+  const store = createStore();
+  store.set(notebookAtom, notebook);
+  store.set(connectionAtom, { state: ConnectionState.OPEN });
+  store.set(requestClientAtom, resolveRequestClient());
+  store.set(showCodeInRunModeAtom, true);
+
+  return (
+    <Provider store={store}>
+      <TooltipProvider>
+        <CellsRenderer appConfig={parseAppConfig({})} mode="read" />
+      </TooltipProvider>
+    </Provider>
+  );
+};
+
+export const EditModeCodeShownStory = {
+  render: () => <EditModeCodeShown />,
+  name: "Edit Mode - Code Shown",
+};
+export const EditModeCodeHiddenStory = {
+  render: () => <EditModeCodeHidden />,
+  name: "Edit Mode - Code Hidden",
+};
+export const ReadModeCodeShownStory = {
+  render: () => {
+    if (typeof window !== "undefined") {
+      (window as W).__MARIMO_STATIC__ = { files: {} };
+    }
+
+    return <ReadModeCodeShown />;
+  },
+  name: "Read Mode - Code Shown",
+};
+export const ReadModeCodeHiddenStory = {
+  render: () => {
+    if (typeof window !== "undefined") {
+      delete (window as W).__MARIMO_STATIC__;
+    }
+    return <ReadModeCodeHidden />;
+  },
+  name: "Read Mode - Code Hidden",
+};
